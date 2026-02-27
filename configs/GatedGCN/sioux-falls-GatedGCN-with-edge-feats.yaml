@@ -1,0 +1,66 @@
+out_dir: results
+metric_best: mae
+metric_agg: argmin
+name_tag: with-edge-feats  # Modified decoder: includes edge features in concatenation
+wandb:
+  use: False
+  project: sioux-falls-traffic
+  entity: your-wandb-entity
+dataset:
+  format: PyG-SiouxFalls
+  name: sioux-falls-traffic
+  task: graph
+  task_type: regression
+  transductive: False
+  node_encoder: False
+  node_encoder_name: LinearNode
+  node_encoder_bn: False
+  edge_encoder: True  # Encode 3-dim edge features to edge_dim
+  edge_encoder_name: LinearEdge
+  edge_encoder_bn: False
+  edge_dim: 128  # Target edge dimension (must match dim_inner)
+  dir: create_sioux_data/processed_data
+posenc_LapPE:
+  enable: False
+posenc_RWSE:
+  enable: False
+train:
+  mode: custom
+  batch_size: 32
+  eval_period: 1
+  ckpt_period: 100
+  enable_ckpt: True
+  auto_resume: False
+model:
+  type: custom_gnn
+  loss_fun: l1
+  edge_decoding: concat  # Following paper: CONCAT(h_i, h_j, e_ij)
+  graph_pooling: mean
+gt:
+  layer_norm: False
+  batch_norm: True
+gnn:
+  head: edge_regression
+  layers_pre_mp: 1  # Add 1 layer to map input dim (11) to hidden dim (128)
+  layers_mp: 5
+  layers_post_mp: 2
+  dim_inner: 128
+  layer_type: gatedgcnconv
+  stage_type: stack
+  batchnorm: True
+  act: relu
+  dropout: 0.1
+  agg: mean
+  normalize_adj: False
+  residual: True
+optim:
+  clip_grad_norm: True
+  optimizer: adamW
+  weight_decay: 1e-5
+  base_lr: 0.001
+  max_epoch: 200  # Following paper: 200 epochs
+  scheduler: cosine_with_warmup
+  num_warmup_epochs: 10
+  min_lr: 1e-6
+  reduce_factor: 0.5
+  schedule_patience: 20
