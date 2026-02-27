@@ -16,6 +16,7 @@ from torchmetrics.functional import (
     auroc,
     mean_absolute_error,
     mean_squared_error,
+    r2_score,
 )
 from torchmetrics.utilities import reduce
 
@@ -83,6 +84,49 @@ class Thresholder:
         """
 
         return f"{self.op_str}{self.threshold}"
+
+
+def rmse(preds: torch.Tensor, target: torch.Tensor, **kwargs) -> torch.Tensor:
+    """Computes the Root Mean Squared Error."""
+    return torch.sqrt(mean_squared_error(preds, target))
+
+
+def wmape(preds: torch.Tensor, target: torch.Tensor, **kwargs) -> torch.Tensor:
+    """
+    Computes the Weighted Mean Absolute Percentage Error.
+
+    Formula: WMAPE = sum(|pred - target|) / sum(target)
+
+    Unlike the standard MAPE which averages per-sample percentage errors
+    (and is unstable when individual target values are near zero), WMAPE
+    weights the absolute error by the total target volume, making it robust
+    for traffic flow distributions that include near-zero values.
+    """
+    preds  = preds.to(torch.float32)
+    target = target.to(torch.float32)
+    sum_abs_error = torch.sum(torch.abs(preds - target))
+    sum_target    = torch.clamp(torch.sum(target), min=EPS)
+    return sum_abs_error / sum_target
+
+
+def geh_statistic(preds: torch.Tensor, target: torch.Tensor, **kwargs) -> torch.Tensor:
+    """
+    Computes the GEH Statistic compliance rate.
+
+    GEH is a standard traffic engineering goodness-of-fit metric:
+        GEH(e) = sqrt( 2 * (pred_e - true_e)^2 / (pred_e + true_e) )
+
+    A model is considered satisfactory when GEH < 5 for >= 85% of links
+    (UK DfT / Highway Capacity Manual standard).
+
+    Returns the proportion (0–1) of edges satisfying GEH < 5.
+    """
+    preds  = preds.to(torch.float32)
+    target = target.to(torch.float32)
+    numerator   = 2.0 * (preds - target) ** 2
+    denominator = torch.clamp(preds + target, min=EPS)
+    geh_vals    = torch.sqrt(numerator / denominator)
+    return (geh_vals < 5.0).float().mean()
 
 
 def pearsonr(preds: torch.Tensor, target: torch.Tensor,
@@ -183,9 +227,12 @@ METRICS_CLASSIFICATION = {
 }
 
 METRICS_REGRESSION = {
-    "mae": mean_absolute_error,
-    "mse": mean_squared_error,
-    "pearsonr": pearsonr,
+    "mae":       mean_absolute_error,
+    "rmse":      rmse,
+    "wmape":     wmape,
+    "r2":        r2_score,
+    "geh":       geh_statistic,
+    "pearsonr":  pearsonr,
     "spearmanr": spearmanr,
 }
 
