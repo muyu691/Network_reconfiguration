@@ -19,7 +19,7 @@ from torch_geometric.graphgym.register import register_loader
 # from graphgps.loader.dataset.coco_superpixels import COCOSuperpixels
 # from graphgps.loader.dataset.malnet_tiny import MalNetTiny
 # from graphgps.loader.dataset.voc_superpixels import VOCSuperpixels
-from graphgps.loader.dataset.sioux_falls_traffic import SiouxFallsTrafficDataset
+# from graphgps.loader.dataset.sioux_falls_traffic import SiouxFallsTrafficDataset
 from graphgps.loader.dataset.network_pairs_topology import NetworkPairsTopologyDataset
 from graphgps.loader.split_generator import (prepare_splits,
                                              set_dataset_splits)
@@ -166,7 +166,7 @@ def load_dataset_master(format, name, dataset_dir):
             dataset = preformat_SiouxFalls(dataset_dir, name)
 
         elif pyg_dataset_id == 'NetworkPairs':
-            # Phase 4 接入点：加载 (G, G') 网络对数据集，并动态注入反归一化参数
+            # Phase 4 entry point: load (G, G') network pairs dataset, and dynamically inject flow denormalization parameters
             dataset = preformat_NetworkPairs(dataset_dir, name)
 
         else:
@@ -664,78 +664,78 @@ def preformat_SiouxFalls(dataset_dir, name):
 
 def preformat_NetworkPairs(dataset_dir, name):
     """
-    Phase 4：加载 (G, G') 网络对拓扑数据集，并动态注入流量反归一化参数。
+    Phase 4: Load (G, G') network pairs topology dataset and dynamically inject flow denormalization parameters.
 
-    此函数完成两件关键事情：
-      1. 从 Phase 1 生成的 flow_scaler.pkl 中读取均值/标准差，
-         动态写入 cfg.dataset.flow_mean / cfg.dataset.flow_std。
-         这两个值是 Phase 3 守恒损失反归一化的必要参数。
-      2. 加载 train/val/test 三个分割，合并为一个带 split_idxs 的 PyG dataset。
+    This function completes two key tasks:
+      1. Read mean/standard deviation from flow_scaler.pkl generated in Phase 1,
+         dynamically write into cfg.dataset.flow_mean / cfg.dataset.flow_std.
+         These two values are necessary parameters for Phase 3 conservation loss de-normalization.
+      2. Load train/val/test splits and merge into a single PyG dataset with split_idxs attribute.
 
     Args:
-        dataset_dir : cfg.dataset.dir 指向的路径，应包含：
+        dataset_dir : The path pointed to by cfg.dataset.dir, should include:
                         train_dataset.pt / val_dataset.pt / test_dataset.pt
                         scalers/flow_scaler.pkl
-        name        : 未使用，保留以兼容 master_loader 的统一接口
+        name        : Unused, reserved for compatibility with the master_loader unified interface
 
     Returns:
-        PyG dataset object，带有 split_idxs 属性供 prepare_splits 使用
+        PyG dataset object, with split_idxs attribute for use by prepare_splits
     """
     import os
     import pickle
 
     actual_dir = os.path.dirname(dataset_dir)
 
-    # ── Step 1：动态加载 flow_scaler 并注入反归一化参数 ────────────────
+    # -- Step 1: Dynamically load flow_scaler and inject denormalization parameters --
     #
-    # 为什么在 Loader 而非模型内部加载？
-    #   - Loader 在训练开始前执行，保证模型初始化时 cfg 已包含正确参数。
-    #   - 将 scaler 元信息存入 cfg 而非传入模型，符合 GraphGPS 的配置驱动范式。
-    #   - 避免在热循环（每个 batch）中重复 I/O 操作。
+    # Why load in Loader instead of inside the model?
+    #   - The loader executes before training starts, ensuring cfg has correct params at model initialization.
+    #   - Storing scaler meta-info in cfg (not passing into model) fits GraphGPS's config-driven paradigm.
+    #   - Avoid repeated I/O operations in hot loop (every batch).
     scaler_path = os.path.join(actual_dir, 'scalers', 'flow_scaler.pkl')
 
     try:
         with open(scaler_path, 'rb') as f:
             flow_scaler = pickle.load(f)
 
-        # StandardScaler 的属性：
-        #   mean_[0]  → 训练集流量均值 μ（辆/小时）
-        #   scale_[0] → 训练集流量标准差 σ（辆/小时）
+        # Attributes of StandardScaler:
+        #   mean_[0]  → training set flow mean μ (vehicles/hour)
+        #   scale_[0] → training set flow standard deviation σ (vehicles/hour)
         flow_mean = float(flow_scaler.mean_[0])
         flow_std  = float(flow_scaler.scale_[0])
 
-        # 写入全局 cfg，供 Phase 3 的 CombinedPINNLoss 使用
+        # Write to global cfg, for use by Phase 3's CombinedPINNLoss
         cfg.dataset.flow_mean = flow_mean
         cfg.dataset.flow_std  = flow_std
 
         logging.info(
-            f"[preformat_NetworkPairs] 已从 {scaler_path} 加载 flow_scaler\n"
-            f"  flow_mean = {flow_mean:.4f} 辆/小时\n"
-            f"  flow_std  = {flow_std:.4f}  辆/小时\n"
-            f"  （已写入 cfg.dataset.flow_mean / cfg.dataset.flow_std）"
+            f"[preformat_NetworkPairs] Successfully loaded flow_scaler from {scaler_path}\n"
+            f"  flow_mean = {flow_mean:.4f} vehicles/hour\n"
+            f"  flow_std  = {flow_std:.4f}  vehicles/hour\n"
+            f"  (Written into cfg.dataset.flow_mean / cfg.dataset.flow_std)"
         )
 
     except FileNotFoundError:
         raise FileNotFoundError(
-            f"\n[错误] 找不到流量 Scaler 文件：{scaler_path}\n\n"
-            f"这意味着 Phase 1 数据生成尚未完成，或数据目录配置有误。\n"
-            f"请按以下步骤操作：\n"
-            f"  1. 进入数据生成目录：\n"
+            f"\n[Error] Could not find flow Scaler file: {scaler_path}\n\n"
+            f"This means Phase 1 data generation is not yet complete, or data directory config is incorrect.\n"
+            f"Please operate as follows:\n"
+            f"  1. Enter the data generation directory:\n"
             f"       cd create_sioux_data\n"
-            f"  2. 运行场景生成：\n"
+            f"  2. Run scenario generation:\n"
             f"       python main_create_dataset.py\n"
-            f"  3. 运行 PyG 数据集构建：\n"
+            f"  3. Build the PyG dataset:\n"
             f"       python build_network_pairs_dataset.py\n\n"
-            f"Scaler 文件将保存到：{scaler_path}\n"
+            f"Scaler file will be saved to: {scaler_path}\n"
         ) from None
 
     except (AttributeError, IndexError, KeyError) as e:
         raise RuntimeError(
-            f"[错误] flow_scaler.pkl 格式异常，无法提取 mean_/scale_ 属性：{e}\n"
-            f"请确认使用的是 sklearn.preprocessing.StandardScaler 对象。"
+            f"[Error] flow_scaler.pkl format exception, failed to extract mean_/scale_ attributes: {e}\n"
+            f"Please ensure this is a sklearn.preprocessing.StandardScaler object."
         ) from e
 
-    # ── Step 2：加载三个分割并合并为统一 dataset ───────────────────────
+    # -- Step 2: Load three splits and merge into unified dataset --
     dataset = join_dataset_splits(
         [NetworkPairsTopologyDataset(root=actual_dir, split=split)
          for split in ['train', 'val', 'test']]

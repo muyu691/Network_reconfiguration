@@ -1,58 +1,60 @@
 """
-Phase 2：双重图神经网络 —— NetworkPairsTopologyModel
+Phase 2: Dual Graph Neural Network —— NetworkPairsTopologyModel
 ======================================================
 
-核心创新：无需 OD 矩阵，仅凭历史流量（flows_old）作为需求代理，
-          预测网络拓扑重构后的新均衡流量（flows_new）。
+Core innovation: Predict new equilibrium flows (flows_new) after network topology reconfiguration using only historical flows (flows_old) as demand proxy, with no need for OD matrix.
 
-三大子模块：
+Three main submodules:
   ┌─────────────────────────────────────────────────────────────────┐
   │ Module 1: OldGraphEncoder                                       │
-  │   在旧图 G 的拓扑上聚合历史流量，输出节点级"历史拥堵记忆"       │
+  │   Aggregates historical flows over the old graph G topology,    │
+  │   outputs node-level "historical congestion memory"             │
   │   h_nodes_old : [N, H]                                          │
   ├─────────────────────────────────────────────────────────────────┤
   │ Module 2: EdgeAlignmentModule                                   │
-  │   纯向量化（无 for 循环）匹配 G 与 G' 的边，                    │
-  │   为每条新图边生成 8 维对齐特征向量                              │
+  │   Fully vectorized (no for loops) matching of edges between G   │
+  │   and G', producing an 8-dim aligned feature for each new edge  │
   │   aligned_features : [E_new, 8]                                 │
   ├─────────────────────────────────────────────────────────────────┤
-  │ Module 3: NewGraphReasoner                                       │
-  │   融合历史记忆，在 G' 拓扑上推理重构后的均衡流量                │
-  │   flow_pred : [E_new, 1]  （Unbounded，适应 StandardScaler）    │
+  │ Module 3: NewGraphReasoner                                      │
+  │   Fuses historical memory, reasons for new equilibrium flows    │
+  │   over the topology of G'                                       │
+  │   flow_pred : [E_new, 1]  (Unbounded, suitable for StandardScaler) │
   └─────────────────────────────────────────────────────────────────┘
 
-批处理兼容性说明：
-  PyG 的 Batch.from_data_list() 会对所有含 'index' 后缀的字段
-  自动加节点偏移量（__inc__ 机制），因此 edge_index_old 和
-  edge_index_new 在批处理后依然是全局正确的节点索引。
-  EdgeAlignmentModule 中的 Hash Key 使用 total_nodes（全局节点数）
-  作为编码基数，确保跨图的键不冲突。
+Batch processing compatibility note:
+  PyG's Batch.from_data_list() adds node offsets automatically to fields ending with 'index'
+  (by __inc__ mechanism). Therefore, edge_index_old and
+  edge_index_new remain globally correct node indices after batching.
+  The Hash Key in EdgeAlignmentModule uses total_nodes (global node count)
+  as encoding base to ensure key uniqueness across graphs.
 """
 
 import torch
 import torch.nn as nn
 from torch_geometric.graphgym.config import cfg
 from torch_geometric.graphgym.register import register_network
+from torch_geometric.utils import to_dense_batch
 
 from graphgps.layer.gatedgcn_layer import GatedGCNLayer
 
 
 # ============================================================
-# 轻量级 GNN Batch 容器
+# Lightweight GNN Batch container
 # ============================================================
 
 class _GNNBatch:
     """
-    极简数据容器，专门用于驱动 GatedGCNLayer.forward()。
+    Minimalist data container—intended solely to drive GatedGCNLayer.forward().
 
-    GatedGCNLayer.forward(batch) 只访问三个字段：
-      batch.x          : [N, H]  节点特征
-      batch.edge_attr  : [E, H]  边特征
-      batch.edge_index : [2, E]  图连接关系
+    GatedGCNLayer.forward(batch) only accesses these three fields:
+      batch.x          : [N, H]  node features
+      batch.edge_attr  : [E, H]  edge features
+      batch.edge_index : [2, E]  connectivity
 
-    当 GatedGCNLayer 以 equivstable_pe=False 初始化时，
-    代码路径 `batch.pe_EquivStableLapPE` 永远不会被执行
-    （Python 短路求值），因此此容器无需包含该字段。
+    When GatedGCNLayer is initialized with equivstable_pe=False,
+    code path `batch.pe_EquivStableLapPE` will never be executed
+    (Python short-circuit evaluation), so this container does not need it.
     """
 
     __slots__ = ('x', 'edge_attr', 'edge_index')
@@ -69,30 +71,30 @@ class _GNNBatch:
 
 
 # ============================================================
-# Module 1: OldGraphEncoder（历史集线器记忆编码器）
+# Module 1: OldGraphEncoder (historical hub memory encoder)
 # ============================================================
 
 class OldGraphEncoder(nn.Module):
     """
-    在旧图 G 的拓扑上编码历史交通拥堵模式。
+    Encodes historical traffic congestion patterns on the old graph G.
 
-    设计要点：
-      - 节点初始化为"白板" ones(N, H)，直接在隐藏空间起步，
-        省去意义不明的 1 → H 线性映射层。
-      - 边输入 = cat([edge_attr_old(3), flow_old(1)]) = [E_old, 4]，
-        经投影层映射到隐藏空间后送入 GatedGCN 栈。
-      - GatedGCN 的门控聚合机制使模型能区分高/低流量路段，
-        有效捕捉"哪些节点是拥堵枢纽"。
+    Design notes:
+      - Nodes are initialized as "blank slate" ones(N, H), starting directly in hidden space,
+        avoiding a meaningless 1 → H linear mapping.
+      - Edge inputs = cat([edge_attr_old(3), flow_old(1)]) = [E_old, 4],
+        then projected into hidden space and fed to the GatedGCN stack.
+      - The gated aggregation of GatedGCN allows the model to distinguish high/low flow links,
+        effectively learning "which nodes are congestion hubs."
 
-    张量形状约定（H = hidden_dim）：
-      输入：
+    Tensor shape conventions (H = hidden_dim):
+      Input:
         edge_index_old  : [2, E_old]
-        edge_attr_old   : [E_old, 3]  - [capacity, speed, length]（已归一化）
-        flow_old        : [E_old, 1]  - 历史均衡流量（已归一化）
-        num_nodes       : int         - 当前批次总节点数
+        edge_attr_old   : [E_old, 3]  - [capacity, speed, length] (normalized)
+        flow_old        : [E_old, 1]  - historical equilibrium flows (normalized)
+        num_nodes       : int         - batch total node count
 
-      输出：
-        h_nodes_old     : [num_nodes, H]  - 节点历史记忆嵌入
+      Output:
+        h_nodes_old     : [num_nodes, H]  - node historical memory embedding
     """
 
     def __init__(
@@ -105,13 +107,13 @@ class OldGraphEncoder(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
 
-        # 边特征投影：将 [capacity, speed, length, flow_old] 映射到隐藏空间
-        # 形状变化：[E_old, 4] → [E_old, H]
-        # GatedGCNLayer 要求节点特征与边特征维度严格相同（均为 H）
+        # Edge feature projection: [capacity, speed, length, flow_old] → hidden space
+        # Shape change: [E_old, 4] → [E_old, H]
+        # GatedGCNLayer requires node and edge features to have the same dimension (H)
         self.edge_proj = nn.Linear(4, hidden_dim)
 
-        # 堆叠 GatedGCN 层：在旧图拓扑上做多轮消息传递
-        # 每一层的 in_dim = out_dim = H，保持维度不变
+        # Stacked GatedGCN layers: multi-round message passing on old graph topology
+        # Each layer: in_dim = out_dim = H, keep dimensions invariant
         self.gnn_layers = nn.ModuleList([
             GatedGCNLayer(
                 in_dim=hidden_dim,
@@ -133,62 +135,61 @@ class OldGraphEncoder(nn.Module):
         device = edge_attr_old.device
         dtype  = edge_attr_old.dtype
 
-        # ── 白板节点初始化 ──────────────────────────────────────────
-        # 直接在隐藏空间 H 维中初始化，避免引入无物理意义的 1→H 线性层。
-        # 所有节点以相同的"无先验"状态出发，历史流量信息完全依靠
-        # GatedGCN 的消息传递从边流向节点。
-        # 形状：[num_nodes, H]
+        # -- Blank node initialization -------------------------------------
+        # Directly initialize in hidden space H, avoiding meaningless 1→H layer.
+        # All nodes start in the same "no prior" state; history is injected solely
+        # via message passing from edge flows.
+        # Shape: [num_nodes, H]
         x = torch.ones(num_nodes, self.hidden_dim, device=device, dtype=dtype)
 
-        # ── 边特征投影 ──────────────────────────────────────────────
+        # -- Edge feature projection ---------------------------------------
         # cat([edge_attr_old(3), flow_old(1)]) → [E_old, 4]
-        # 然后投影到隐藏空间      → [E_old, H]
+        # then project to hidden space      → [E_old, H]
         e_raw = torch.cat([edge_attr_old, flow_old], dim=-1)  # [E_old, 4]
         e = self.edge_proj(e_raw)                              # [E_old, H]
 
-        # ── 堆叠消息传递（旧图拓扑）────────────────────────────────
+        # -- Stacked message passing (old graph topology) -----------------
         for layer in self.gnn_layers:
             mini_batch = _GNNBatch(x, e, edge_index_old)
             mini_batch = layer(mini_batch)
             x = mini_batch.x           # [num_nodes, H]
             e = mini_batch.edge_attr   # [E_old, H]
 
-        # 返回节点嵌入作为"历史拥堵记忆"，边嵌入不再需要
+        # Return node embedding as "historical congestion memory", discard edge embeddings
         return x   # h_nodes_old : [num_nodes, H]
 
 
 # ============================================================
-# Module 2: EdgeAlignmentModule（异构边特征对齐）
+# Module 2: EdgeAlignmentModule (heterogeneous edge feature alignment)
 # ============================================================
 
 class EdgeAlignmentModule(nn.Module):
     """
-    向量化的异构边特征对齐模块（无可学习参数）。
+    Vectorized heterogeneous edge feature alignment module (no learnable params).
 
-    核心算法：基于节点对 Hash 的 O(E_old + E_new) 向量化匹配。
+    Core algorithm: O(E_old + E_new) vectorized matching based on node-pair hash.
 
-    对齐规则（严格遵循 .cursorrules Phase 2 规范）：
+    Alignment rules (strictly follow .cursorrules Phase 2 spec):
     ┌──────────────────────────────────────────────────────────────┐
-    │ 保留边（G 和 G' 中均存在）：                                 │
+    │ Retained edge (present in both G and G'):                   │
     │   [edge_attr_old(3), flow_old(1), edge_attr_new(3), 0(1)]   │
-    │   → 维度合计 8，is_new_edge = 0                             │
+    │   → 8-dim total, is_new_edge = 0                            │
     ├──────────────────────────────────────────────────────────────┤
-    │ 新修边（仅 G' 中存在）：                                     │
+    │ Added/new edge (only in G'):                                │
     │   [zeros(3),         zero(1),    edge_attr_new(3), 1(1)]    │
-    │   → 维度合计 8，is_new_edge = 1                             │
+    │   → 8-dim total, is_new_edge = 1                            │
     └──────────────────────────────────────────────────────────────┘
 
-    Hash 编码方案：
+    Hash coding scheme:
       key(src, dst) = src × total_nodes + dst
-      由于 src, dst ∈ [0, total_nodes)，任意不同节点对的 key 唯一。
+      Since src, dst ∈ [0, total_nodes), key is unique for each node-pair.
 
-    批处理正确性：
-      PyG Batch 对边索引施加的节点偏移（__inc__）使得跨图的节点 ID
-      互不重叠，因此以 total_nodes（批次全局节点数）为编码基数时，
-      不同图的边 key 天然不冲突。
+    Batch correctness:
+      PyG applies node offset to edge indices (__inc__) such that node IDs in different graphs
+      do not overlap. Thus, using total_nodes (batch-global node count) as hash base, keys are unique.
 
-    张量形状约定（H = hidden_dim）：
-      输入：
+    Tensor shape conventions (H = hidden_dim):
+      Input:
         edge_index_old  : [2, E_old]
         edge_attr_old   : [E_old, 3]
         flow_old        : [E_old, 1]
@@ -196,7 +197,7 @@ class EdgeAlignmentModule(nn.Module):
         edge_attr_new   : [E_new, 3]
         total_nodes     : int
 
-      输出：
+      Output:
         aligned_features : [E_new, 8]
     """
 
@@ -215,71 +216,71 @@ class EdgeAlignmentModule(nn.Module):
         E_old  = edge_index_old.shape[1]
         E_new  = edge_index_new.shape[1]
 
-        # ── Step 1：将边的节点对编码为唯一整数 Key ──────────────────
+        # -- Step 1: Encode edge node-pairs as unique integer keys ----------
         #
-        # 公式：key(src, dst) = src × total_nodes + dst
+        # Formula: key(src, dst) = src × total_nodes + dst
         #
-        # 原理：由于 0 ≤ src, dst < total_nodes，
-        #       不同 (src, dst) 对映射的 key 一定不同，等价于
-        #       将二维坐标展开为一维坐标（行主序）。
+        # Rationale: Since 0 ≤ src, dst < total_nodes,
+        #   any distinct (src, dst) produces distinct key—equiv. to
+        #   flattening 2D index to 1D (row-major order).
         #
-        # 时间复杂度：O(E_old + E_new)，零 Python for 循环。
+        # Time complexity: O(E_old + E_new), no Python for-loops.
         old_keys = edge_index_old[0] * total_nodes + edge_index_old[1]  # [E_old]
         new_keys = edge_index_new[0] * total_nodes + edge_index_new[1]  # [E_new]
 
-        # ── Step 2：建立反向查找表 key → old_edge_index ─────────────
+        # -- Step 2: Build reverse lookup table key → old_edge_index -------
         #
-        # key_to_old_idx[key] = 旧图中该边的索引，-1 表示不存在。
-        # 对于 Sioux Falls（24 节点，批量 64 图）：
-        #   total_nodes = 24 × 64 = 1536，max_key ≈ 2.36M，内存约 9MB，可行。
+        # key_to_old_idx[key] = index of this edge in old graph, -1 means not exists.
+        # For Sioux Falls (24 nodes, batch size 64):
+        #   total_nodes = 24 × 64 = 1536, max_key ≈ 2.36M, about 9MB RAM, feasible.
         max_key = total_nodes * total_nodes
         key_to_old_idx = torch.full(
             (max_key,), fill_value=-1, dtype=torch.long, device=device
         )
 
         old_edge_pos = torch.arange(E_old, dtype=torch.long, device=device)
-        # 向量化散列写入：将旧图每条边的 key 映射到其在 edge_attr_old 中的行号
-        # （若存在重复边，后写者覆盖先写者；有向图理论上不存在此情况）
+        # Vectorized hash assignment: map each edge key in old graph to its row in edge_attr_old
+        # (If duplicate edges exist, latter overwrite former; for directed graphs, shouldn't happen)
         key_to_old_idx[old_keys] = old_edge_pos                          # [max_key]
 
-        # ── Step 3：为每条新图边查找其在旧图中的匹配索引 ─────────────
+        # -- Step 3: For each new edge, lookup if it exists in old graph --
         #
-        # match_idx[i] = j  表示 edge_index_new[:, i] 对应 edge_attr_old[j]
-        # match_idx[i] = -1 表示该边是新修边，旧图中不存在
-        match_idx = key_to_old_idx[new_keys]  # [E_new]，值域 {-1, 0, ..., E_old-1}
+        # match_idx[i] = j: edge_index_new[:, i] matches edge_attr_old[j]
+        # match_idx[i] = -1: this is an added edge, does not exist in old graph
+        match_idx = key_to_old_idx[new_keys]  # [E_new], range {-1, ..., E_old-1}
 
-        # ── Step 4：构建旧图侧的对齐特征（4 维）──────────────────────
+        # -- Step 4: Construct aligned features from old graph side (4 dims)
         #
-        # 保留边：使用真实的旧属性 + 旧流量
-        # 新修边：补零（代表"此前不存在"）
+        # Retained edge: use real old features + old flows
+        # Added edge: fill zeros (representing "did not exist before")
         #
-        # old_feats[j] = cat([edge_attr_old[j], flow_old[j]])，形状 [4]
+        # old_feats[j] = cat([edge_attr_old[j], flow_old[j]]) shape [4]
         old_feats = torch.cat([edge_attr_old, flow_old], dim=-1)  # [E_old, 4]
 
-        # 初始化为零矩阵（默认：新修边对应旧侧全补零）
+        # Initialize zero matrix (default: all-added edges are zero from old side)
         aligned_old = torch.zeros(E_new, 4, dtype=dtype, device=device)
 
-        # 布尔掩码：标记哪些新图边在旧图中存在（保留边）
+        # Boolean mask: mark which new edges exist in old graph (retained)
         retained_mask = match_idx >= 0  # [E_new], bool
 
-        # 仅对保留边执行向量化填充，避免 -1 索引导致越界
+        # Only fill for retained edges, avoid -1 index out of bound
         if retained_mask.any():
             # aligned_old[retained_mask] ← old_feats[match_idx[retained_mask]]
-            # 此操作为纯张量索引，无 Python 循环
+            # pure tensor indexing, no Python loops
             aligned_old[retained_mask] = old_feats[match_idx[retained_mask]]
 
-        # ── Step 5：构建 is_new_edge 指示变量 ─────────────────────────
+        # -- Step 5: Build is_new_edge indicator ---------------------------
         #
-        # is_new_edge = 1 表示新修边（旧图不存在），模型可据此差异化处理
-        # is_new_edge = 0 表示保留边（旧图已存在）
-        # 形状：[E_new, 1]，float 类型以便参与线性层计算
+        # is_new_edge = 1 marks new edge (not exist in old graph), model can distinguish
+        # is_new_edge = 0 marks retained edge (exist in old graph)
+        # Shape: [E_new, 1], float dtype for use in linear layers
         is_new_edge = (~retained_mask).to(dtype).unsqueeze(1)  # [E_new, 1]
 
-        # ── Step 6：拼接最终对齐特征 ────────────────────────────────
+        # -- Step 6: Concatenate final aligned feature ---------------------
         #
-        # 保留边：[edge_attr_old(3), flow_old(1), edge_attr_new(3), 0(1)] = 8 维
-        # 新修边：[zeros(3),         zero(1),     edge_attr_new(3), 1(1)] = 8 维
-        # 形状严格为 [E_new, 8]
+        # Retained edge: [edge_attr_old(3), flow_old(1), edge_attr_new(3), 0(1)] = 8
+        # New edge:      [zeros(3),        zero(1),      edge_attr_new(3), 1(1)] = 8
+        # Shape strictly [E_new, 8]
         aligned_features = torch.cat(
             [aligned_old, edge_attr_new, is_new_edge], dim=-1
         )  # [E_new, 8]
@@ -288,39 +289,158 @@ class EdgeAlignmentModule(nn.Module):
 
 
 # ============================================================
-# Module 3: NewGraphReasoner（破旧立新的推理器）
+# Implicit Demand Virtual Routing Layer (隐式需求虚拟边层)
+# ============================================================
+
+class ImplicitVirtualRoutingLayer(nn.Module):
+    r"""
+    隐式需求虚拟路由层 —— 通过全局自注意力打破 GNN 局部感受野的限制。
+
+    物理意义:
+      交通网络发生断链或属性剧变时，流量会在全局范围内重新分配。
+      传统 GNN 每层只聚合 1-hop 邻居，对于远端 OD 对之间的流量转移，
+      需要叠加大量层数才能传播信号，而叠加层数又会引发过平滑。
+
+      本层在同一图内的所有节点之间计算 Self-Attention 权重，
+      等价于动态建立了"隐式虚拟边" (Implicit Virtual Links)：
+        - 注意力得分 $\alpha_{ij}$ 高 → 节点 $i, j$ 之间存在强关联
+          （潜在 OD 关系、替代路径关系、流量守恒约束关系）
+        - 这些虚拟边让全局流量重分配信号能在**单层内**瞬间传播
+
+      数学表达:
+        $$\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^T}{\sqrt{d_k}}\right) V$$
+
+      架构 (Post-LN Transformer Block):
+        $$\mathbf{x}_{\text{mid}} = \text{LN}\!\left(\mathbf{x} + \text{MHA}(\mathbf{x})\right)$$
+        $$\mathbf{x}_{\text{out}} = \text{LN}\!\left(\mathbf{x}_{\text{mid}} + \text{FFN}(\mathbf{x}_{\text{mid}})\right)$$
+
+    Batch 安全性 (严防跨图污染):
+      PyG 的 to_dense_batch 将扁平的 [N, H] → [B, Max_N, H] 的 Dense 张量，
+      配合 key_padding_mask=~mask 传入 MultiheadAttention，可保证:
+        1. Padding 位置（虚假节点）不会参与注意力计算
+        2. 不同图的节点之间绝不会发生任何信息交换
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+
+        # 多头自注意力：在同一图内建立全局隐式虚拟边
+        # batch_first=True → 输入/输出格式 [B, Seq, H]，与 to_dense_batch 输出一致
+        self.attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        # Post-Attention LayerNorm (残差融合后归一化)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        # Post-FFN LayerNorm
+        self.norm2 = nn.LayerNorm(hidden_dim)
+
+        # 前馈网络 (FFN)：两层 Linear + ReLU，标准 4x 扩展比
+        # 作用：对注意力聚合后的全局信息做非线性变换
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,      # [N, hidden_dim]  扁平节点特征
+        batch: torch.Tensor,   # [N]              节点归属索引
+    ) -> torch.Tensor:         # → [N, hidden_dim]
+        """
+        前向传播：全局自注意力 → 残差 + LayerNorm → FFN → 残差 + LayerNorm。
+
+        Args:
+            x     : 扁平节点特征，batch 内所有图的节点拼接在一起，形状 [N, H]
+            batch : 节点归属索引，第 i 个节点属于第 batch[i] 个图，形状 [N]
+
+        Returns:
+            x_flat : 具有全局视野的节点特征（隐式虚拟边信息已融合），形状 [N, H]
+        """
+        # ── Step A: Dense 转换 ─────────────────────────────────────
+        # 将扁平的 [N, H] 转为三维 Dense 张量 [B, Max_N, H]
+        # mask: [B, Max_N]，True = 真实节点，False = Padding（用 0 填充）
+        # 物理意义：将 mini-batch 中各个图的节点对齐为等长序列，
+        #           为 Self-Attention 的矩阵运算做准备
+        x_dense, mask = to_dense_batch(x, batch)  # [B, Max_N, H], [B, Max_N]
+
+        # ── Step B: 全局自注意力（建立隐式虚拟边）──────────────────
+        # key_padding_mask=~mask: 值为 True 的位置会被 Attention 忽略
+        #   → Padding 节点不产生/不接收注意力
+        #   → 不同图之间的节点绝对不会通信（因为它们在不同的 batch 维度）
+        # 物理意义：每个节点与同图内所有其它节点计算注意力，
+        #           建立基于特征相似性的"隐式虚拟边"，
+        #           让潜在 OD 对和替代路径关系被一步到位地捕获
+        attn_out, _ = self.attn(
+            query=x_dense,
+            key=x_dense,
+            value=x_dense,
+            key_padding_mask=~mask,
+        )  # [B, Max_N, H]
+
+        # ── Step C: 残差连接 + LayerNorm (Post-Attention) ─────────
+        # $\mathbf{x}_{\text{mid}} = \text{LN}(\mathbf{x} + \text{MHA}(\mathbf{x}))$
+        # 残差连接保留原始局部特征，注意力输出叠加全局信息
+        x_dense = self.norm1(x_dense + attn_out)  # [B, Max_N, H]
+
+        # ── Step D: FFN + 残差 + LayerNorm ────────────────────────
+        # $\mathbf{x}_{\text{out}} = \text{LN}(\mathbf{x}_{\text{mid}} + \text{FFN}(\mathbf{x}_{\text{mid}}))$
+        ffn_out = self.ffn(x_dense)                # [B, Max_N, H]
+        x_dense = self.norm2(x_dense + ffn_out)    # [B, Max_N, H]
+
+        # ── Step E: 还原为扁平格式 ────────────────────────────────
+        # 用 mask 布尔索引取出真实节点，过滤掉 Padding
+        # mask 中 True 的数量恰好等于 N（所有真实节点总数），维度严格匹配
+        x_flat = x_dense[mask]  # [N, H]
+
+        return x_flat
+
+
+# ============================================================
+# Module 3: NewGraphReasoner (reasoner for new topology)
 # ============================================================
 
 class NewGraphReasoner(nn.Module):
     """
-    在新图 G' 的拓扑上融合历史记忆并推理未来均衡流量。
+    Fuses historical memory and reasons future equilibrium flows over new graph G'.
 
-    Node Fusion 设计原则（关键约束）：
-      x_new_init = ones(N, H)           ← 新图白板节点
+    Node Fusion principle (critical constraint):
+      x_new_init = ones(N, H)           ← blank node for new graph
       x_fused    = cat([x_new_init, h_nodes_old])  → [N, 2H]
       x          = node_fusion(x_fused)            → [N, H]
 
-      ⚠️  严格禁止在 node_fusion 后添加残差连接！
-          残差 x = x_fused_proj + h_nodes_old 会形成"记忆捷径"，
-          让模型通过直接复制旧流量绕过对新拓扑的学习。
-          强制非线性压缩（Linear→ReLU→Dropout）迫使模型
-          从新图的消息传递中重新发现流量分布。
+      ⚠️  Strictly forbid residual connections after node_fusion!
+          Residual x = x_fused_proj + h_nodes_old makes a "memory shortcut",
+          letting the model copy old flows and bypass learning new topology.
+          Force nonlinear compression (Linear→ReLU→Dropout) to ensure the model
+          rediscover flow patterns by new graph message passing.
 
-    Edge Decoder 设计：
-      输入 = cat([x_src(H), x_dst(H), aligned_features(8)]) → [2H + 8]
-      输出 = flow_pred [E_new, 1]
-      最后一层为纯线性层，无激活函数（Unbounded Output）。
-      标签经过 StandardScaler（零均值，单位方差，含负值），
-      有界激活（如 ReLU/Sigmoid）会造成系统性预测偏差。
+    Edge Decoder design:
+      Input = cat([x_src(H), x_dst(H), aligned_features(8)]) → [2H + 8]
+      Output = flow_pred [E_new, 1]
+      Last layer is a pure linear, no activation (Unbounded Output).
+      Target has been StandardScaler-normalized (mean 0, std 1, can be negative),
+      any bounded activation (like ReLU/Sigmoid) introduces distribution bias.
 
-    张量形状约定（H = hidden_dim）：
-      输入：
+    Tensor shape conventions (H = hidden_dim):
+      Input:
         edge_index_new   : [2, E_new]
         aligned_features : [E_new, 8]
         h_nodes_old      : [num_nodes, H]
         num_nodes        : int
 
-      输出：
+      Output:
         flow_pred : [E_new, 1]
     """
 
@@ -330,28 +450,39 @@ class NewGraphReasoner(nn.Module):
         num_layers: int,
         dropout: float,
         residual: bool,
+        num_heads: int = 4,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
 
-        # ── Node Fusion 层 ─────────────────────────────────────────
-        # 输入：cat([x_new_init(H), h_nodes_old(H)]) → [N, 2H]
-        # 输出：[N, H]
+        # -- Node Fusion layer --------------------------------------------
+        # Input: cat([x_new_init(H), h_nodes_old(H)]) → [N, 2H]
+        # Output: [N, H]
         #
-        # 设计理念：通过非线性压缩，模型被迫在"白板"（适应新拓扑）
-        # 与"历史记忆"（旧流量模式）之间找到动态平衡。
-        # 严格禁止残差——避免模型退化为直接输出旧流量的捷径策略。
+        # Principle: Nonlinear compression forces a dynamic balance between
+        # the "blank" (for new topology adaptation) and "historical memory" (old flow pattern).
+        # Strictly no residual — avoids degenerate strategies that just outputs old flows.
         self.node_fusion = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
         )
 
-        # 对齐边特征投影：[E_new, 8] → [E_new, H]
-        # GatedGCNLayer 要求节点与边特征维度相同
+        # -- 隐式需求虚拟路由层 (Implicit Virtual Routing) ----------------
+        # 在 node_fusion 输出后、GatedGCN 局部消息传递之前，
+        # 通过全局自注意力为每个节点注入全图视野，
+        # 打破 GNN 短视问题，让远端的流量重分配信号一步到位地传播。
+        self.virtual_routing = ImplicitVirtualRoutingLayer(
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+        )
+
+        # Project the aligned edge features: [E_new, 8] → [E_new, H]
+        # GatedGCNLayer requires same dimension for node and edge features
         self.edge_proj = nn.Linear(8, hidden_dim)
 
-        # 堆叠 GatedGCN 层：在新图拓扑上做多轮消息传递
+        # Stacked GatedGCN layers: multi-round message passing on new graph topology
         self.gnn_layers = nn.ModuleList([
             GatedGCNLayer(
                 in_dim=hidden_dim,
@@ -362,24 +493,24 @@ class NewGraphReasoner(nn.Module):
             for _ in range(num_layers)
         ])
 
-        # ── 边级流量解码器 ─────────────────────────────────────────
-        # 输入：cat([x_src(H), x_dst(H), aligned_features(8)]) → [2H + 8]
+        # -- Edge-level flow decoder --------------------------------------
+        # Input: cat([x_src(H), x_dst(H), aligned_features(8)]) → [2H + 8]
         #
-        # 设计理念：显式地将"源节点状态 + 目标节点状态 + 边本身特征"
-        # 三者融合，比仅用边特征的解码器更能捕捉方向性流量规律。
-        # aligned_features 保留原始 8 维（含 is_new_edge 标志位），
-        # 让解码器区分新修边与保留边，差异化地预测其流量。
+        # Principle: Explicitly fuses "source node state + target node state + edge features";
+        # better captures directional flow laws than decoding from edge only.
+        # aligned_features retains original 8 dims (including is_new_edge bit);
+        # allows decoder to distinguish new/retained edges and predict them differently.
         #
-        # 最后一层：nn.Linear(H, 1)，无激活函数（Unbounded Output）。
+        # Last layer: nn.Linear(H, 1), no activation (Unbounded Output).
         decoder_in_dim = hidden_dim * 2 + 8
         self.edge_decoder = nn.Sequential(
             nn.Linear(decoder_in_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
-            # ⚠️  此处故意省略激活函数！
-            # StandardScaler 处理后的标签分布在 (-∞, +∞)，
-            # 任何有界激活（ReLU/Tanh/Sigmoid）都会引入偏差。
+            # ⚠️  Intentionally omit activation here!
+            # StandardScaler-processed targets span (−∞, +∞),
+            # any bounded activation (ReLU/Tanh/Sigmoid) will bias predictions.
         )
 
     def forward(
@@ -388,51 +519,71 @@ class NewGraphReasoner(nn.Module):
         aligned_features: torch.Tensor,  # [E_new, 8]
         h_nodes_old: torch.Tensor,       # [num_nodes, H]
         num_nodes: int,
+        batch_vec: torch.Tensor,         # [num_nodes] 节点归属索引（必须由 PyG Batch 提供）
     ) -> torch.Tensor:                   # → [E_new, 1]
 
         device = h_nodes_old.device
         dtype  = h_nodes_old.dtype
 
-        # ── 白板节点初始化（新图）────────────────────────────────────
-        # x_new_init 代表"对新图一无所知"的初始状态。
-        # 与 h_nodes_old 融合后，模型需要通过新图的拓扑自行重分配流量，
-        # 而不是简单地继承旧状态。
-        # 形状：[num_nodes, H]
+        # -- Blank node initialization (new graph) ------------------------
+        # x_new_init represents "no prior knowledge" for new graph.
+        # After fusing with h_nodes_old, model must (re)assign flows by new topology,
+        # not just inherit old states.
+        # Shape: [num_nodes, H]
         x_new_init = torch.ones(num_nodes, self.hidden_dim, device=device, dtype=dtype)
 
-        # ── 历史记忆融合（Node Fusion）────────────────────────────────
-        # 拼接白板节点与历史记忆：[N, H] ‖ [N, H] → [N, 2H]
-        # 经非线性融合层压缩：[N, 2H] → [N, H]
+        # -- Historical memory fusion (Node Fusion) ------------------------
+        # Concatenate blank node with historical embedding: [N, H] || [N, H] → [N, 2H]
+        # Then nonlinearly compress: [N, 2H] → [N, H]
         #
-        # ⚠️  无残差连接！x 必须完全由 node_fusion 的非线性变换决定，
-        #     不允许 h_nodes_old 绕过变换直接流入下游网络。
+        # ⚠️  No residual connection! x must be entirely determined by node_fusion nonlinear transform,
+        #     h_nodes_old can't shortcut to downstream network.
         x_cat = torch.cat([x_new_init, h_nodes_old], dim=-1)  # [N, 2H]
         x = self.node_fusion(x_cat)                            # [N, H]
 
-        # ── 对齐边特征投影 ─────────────────────────────────────────
-        # 将 8 维对齐特征投影到隐藏空间，满足 GatedGCNLayer 维度约束
-        # 形状：[E_new, 8] → [E_new, H]
+        # -- 隐式需求虚拟路由 (Implicit Virtual Routing) -------------------
+        # 在局部 GatedGCN 消息传递之前，先通过全局自注意力建立隐式虚拟边，
+        # 让每个节点获得全图视野。这对断链等剧烈拓扑变异至关重要：
+        #   - 断链后，受影响节点需要立即知道远端替代路径的存在
+        #   - 传统 GNN 需要多跳才能传播的全局重分配信号，在这里一步完成
+        #
+        # ⚠️  Fail-fast 校验：batch_vec 必须由上层 (NetworkPairsTopologyModel) 显式传入。
+        #     若为 None，说明 PyG Batch 未能生成 batch.batch（通常因为 Data 对象缺少 x 字段），
+        #     此时若静默构造全零 batch_vec，会导致跨图注意力污染——这是灾难性的隐式 Bug。
+        #     确保 build_network_pairs_dataset.py 中 Data 对象包含 data.x 即可避免此问题。
+        assert batch_vec is not None, (
+            "batch_vec is None! ImplicitVirtualRoutingLayer 需要 PyG 的 batch.batch 向量来区分图。"
+            "请确保 Data 对象包含 x 字段（如 data.x = torch.ones(num_nodes, 1)），"
+            "以便 PyG Batch.from_data_list() 自动生成 batch.batch。"
+        )
+        assert batch_vec.shape[0] == num_nodes, (
+            f"batch_vec 长度 ({batch_vec.shape[0]}) 与 num_nodes ({num_nodes}) 不匹配！"
+        )
+        x = self.virtual_routing(x, batch_vec)  # [N, H]，已融合全局隐式 OD 信息
+
+        # -- Aligned edge feature projection -------------------------------
+        # Project 8-dim aligned feature into hidden space for GatedGCNLayer
+        # Shape: [E_new, 8] → [E_new, H]
         e = self.edge_proj(aligned_features)  # [E_new, H]
 
-        # ── 在新图拓扑上堆叠消息传递 ─────────────────────────────────
-        # 此阶段是模型"理解新拓扑"的关键：
-        #   - 新修边（is_new_edge=1）会将其物理属性传播给相邻节点
-        #   - 删除的边不再存在，流量自然重分布到保留路径
+        # -- Stacked message passing over new graph topology ---------------
+        # This is where model "understands" new topology:
+        #   - Added edges (is_new_edge=1) can propagate their physical attrs to neighbors
+        #   - Deleted edges disappear, flow redistributes over retained paths
         for layer in self.gnn_layers:
             mini_batch = _GNNBatch(x, e, edge_index_new)
             mini_batch = layer(mini_batch)
             x = mini_batch.x           # [num_nodes, H]
             e = mini_batch.edge_attr   # [E_new, H]
 
-        # ── 边级流量解码 ───────────────────────────────────────────
-        # 为每条新图边提取源节点、目标节点的嵌入，
-        # 与原始 8 维对齐特征（未经投影）拼接，送入解码器。
+        # -- Edge-level flow decoding --------------------------------------
+        # For each new edge, extract src/dst node embeddings,
+        # concat with raw 8-dim aligned features (not projected), feed to decoder.
         #
-        # 保留原始 aligned_features（而非投影后的 e）：
-        #   1. aligned_features 包含 is_new_edge 标志位，
-        #      让解码器显式感知边的"新旧"属性
-        #   2. 原始物理属性（capacity, speed, length）的量纲
-        #      与 flow 直接相关，不经投影失真地喂给解码器
+        # Keep original aligned_features (not projected/e),
+        #   1. aligned_features contains is_new_edge indicator (explicitly shows new/retained)
+        #   2. Raw physical attrs (capacity, speed, length) have flow-related dimension,
+        #      directly feed un-distorted.
         src_idx, dst_idx = edge_index_new[0], edge_index_new[1]
         edge_repr = torch.cat(
             [x[src_idx], x[dst_idx], aligned_features], dim=-1
@@ -444,38 +595,38 @@ class NewGraphReasoner(nn.Module):
 
 
 # ============================================================
-# 主模型：NetworkPairsTopologyModel
+# Main model: NetworkPairsTopologyModel
 # ============================================================
 
 @register_network('topology_gnn')
 class NetworkPairsTopologyModel(nn.Module):
     """
-    双重图神经网络主模型，针对交通网络拓扑重构场景。
+    Main dual graph neural network model for traffic network topology reconfiguration.
 
-    严格遵守项目约束：
-      - 无 OD 矩阵输入（batch.x 中仅含全 1 占位符，模型内部不使用）
-      - flows_old 作为需求代理（历史流量，模型的核心输入之一）
-      - 最终预测为 StandardScaler 空间的无界实数，损失函数在调用方计算
+    Strictly enforces project constraints:
+      - No OD matrix input (batch.x contains only all-ones placeholder, not used by model)
+      - flows_old as proxy for demand (historical flow is a key model input)
+      - Final prediction is unbounded real number in StandardScaler space; loss is computed externally
 
-    期望的 PyG Batch 字段（由 Phase 1 的 build_network_pairs_dataset.py 生成）：
-      batch.edge_index_old : [2, E_old_total]   旧图连接（已施加批处理节点偏移）
-      batch.edge_attr_old  : [E_old_total, 3]   旧图物理属性（归一化）
-      batch.flow_old       : [E_old_total, 1]   旧图历史流量（归一化）
-      batch.edge_index_new : [2, E_new_total]   新图连接（已施加批处理节点偏移）
-      batch.edge_attr_new  : [E_new_total, 3]   新图物理属性（归一化）
-      batch.y              : [E_new_total, 1]   新图均衡流量（归一化，Ground Truth）
-      batch.num_nodes      : int                批次总节点数（PyG 自动求和）
+    Expected PyG Batch fields (generated by Phase 1 build_network_pairs_dataset.py):
+      batch.edge_index_old : [2, E_old_total]   old graph connectivity (node offset done)
+      batch.edge_attr_old  : [E_old_total, 3]   old graph physical attrs (normalized)
+      batch.flow_old       : [E_old_total, 1]   old graph flows (normalized)
+      batch.edge_index_new : [2, E_new_total]   new graph connectivity (node offset done)
+      batch.edge_attr_new  : [E_new_total, 3]   new graph physical attrs (normalized)
+      batch.y              : [E_new_total, 1]   new graph eq. flows (normalized, ground truth)
+      batch.num_nodes      : int                total node count (PyG autocompute sum)
 
     Args:
-        dim_in  : 占位参数（GraphGym 接口约定），模型内部不使用
-        dim_out : 占位参数（GraphGym 接口约定），输出维度由架构固定为 1
+        dim_in  : placeholder (for GraphGym API), not used internally
+        dim_out : placeholder (for GraphGym API), output dim always 1 by design
     """
 
     def __init__(self, dim_in: int, dim_out: int) -> None:
         super().__init__()
 
-        # 从 cfg.topology_gnn 读取所有超参数
-        # 对应配置文件：graphgps/config/topology_gnn_config.py
+        # Read all hyperparams from cfg.topology_gnn
+        # Config file: graphgps/config/topology_gnn_config.py
         hidden_dim     = cfg.topology_gnn.hidden_dim
         num_layers_old = cfg.topology_gnn.num_layers_old
         num_layers_new = cfg.topology_gnn.num_layers_new
@@ -490,46 +641,49 @@ class NetworkPairsTopologyModel(nn.Module):
         )
         self.aligner  = EdgeAlignmentModule()
 
+        num_heads       = cfg.topology_gnn.num_heads
+
         self.reasoner = NewGraphReasoner(
             hidden_dim=hidden_dim,
             num_layers=num_layers_new,
             dropout=dropout,
             residual=residual,
+            num_heads=num_heads,
         )
         def replace_bn_with_ln(module):
             for name, child in module.named_children():
-                # 如果发现名字里带有 BatchNorm 的层
+                # If finds layer containing 'BatchNorm' in name
                 if 'BatchNorm' in child.__class__.__name__:
-                    # 用 LayerNorm 替换它
-                    setattr(module, name, nn.LayerNorm(child.weight.shape[0]))
+                    # Replace with LayerNorm
+                    setattr(module, name, nn.LayerNorm(child.num_features))
                 else:
-                    # 递归处理子模块
+                    # Recursively process child modules
                     replace_bn_with_ln(child)
-                    
+
         replace_bn_with_ln(self)
 
     def forward(self, batch):
         """
-        完整前向传播。
+        Full forward pass.
 
-        流程：
-          1. OldGraphEncoder  → h_nodes_old : [N_total, H]
+        Pipeline:
+          1. OldGraphEncoder     → h_nodes_old : [N_total, H]
           2. EdgeAlignmentModule → aligned_features : [E_new_total, 8]
-          3. NewGraphReasoner → flow_pred : [E_new_total, 1]
+          3. NewGraphReasoner    → flow_pred : [E_new_total, 1]
 
         Args:
-            batch : PyG Batch 对象（包含一个 mini-batch 的 (G, G') 对）
+            batch : PyG Batch object (contains a mini-batch of (G, G') pairs)
 
         Returns:
-            pred : torch.Tensor [E_new_total, 1]  预测流量（标准化空间）
-            true : torch.Tensor [E_new_total, 1]  真实流量（标准化空间）
+            pred : torch.Tensor [E_new_total, 1]  predicted flows (in normalized space)
+            true : torch.Tensor [E_new_total, 1]  true flows (in normalized space)
         """
-        # PyG 在批处理时自动将各图的 num_nodes 相加，
-        # 得到当前批次的全局节点总数（用于 GNN 聚合和 Hash 匹配）
+        # PyG automatically sums num_nodes across all graphs in the batch,
+        # resulting in current batch's global node count (for GNN aggregation & hash matching)
         total_nodes: int = batch.num_nodes
 
-        # ── Module 1：在旧图上编码历史拥堵记忆 ───────────────────────
-        # 输出：h_nodes_old [total_nodes, H]
+        # -- Module 1: Historical congestion memory encoding on old graph -----
+        # Output: h_nodes_old [total_nodes, H]
         h_nodes_old = self.encoder(
             edge_index_old=batch.edge_index_old,
             edge_attr_old=batch.edge_attr_old,
@@ -537,8 +691,8 @@ class NetworkPairsTopologyModel(nn.Module):
             num_nodes=total_nodes,
         )
 
-        # ── Module 2：向量化对齐新旧图边特征 ─────────────────────────
-        # 输出：aligned_features [E_new_total, 8]
+        # -- Module 2: Vectorized alignment of new/old edge features ----------
+        # Output: aligned_features [E_new_total, 8]
         aligned_features = self.aligner(
             edge_index_old=batch.edge_index_old,
             edge_attr_old=batch.edge_attr_old,
@@ -548,13 +702,16 @@ class NetworkPairsTopologyModel(nn.Module):
             total_nodes=total_nodes,
         )
 
-        # ── Module 3：融合历史记忆，在新图上推理流量 ──────────────────
-        # 输出：flow_pred [E_new_total, 1]
+        # -- Module 3: Fusing history, reasoning flows on new graph -----------
+        # Output: flow_pred [E_new_total, 1]
+        # batch.batch: [N_total] 节点归属索引，传给 ImplicitVirtualRoutingLayer
+        #   确保全局自注意力只在同一图内的节点间进行
         flow_pred = self.reasoner(
             edge_index_new=batch.edge_index_new,
             aligned_features=aligned_features,
             h_nodes_old=h_nodes_old,
             num_nodes=total_nodes,
+            batch_vec=batch.batch,
         )
 
         return flow_pred, batch.y

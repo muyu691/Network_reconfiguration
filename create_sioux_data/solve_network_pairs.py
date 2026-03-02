@@ -52,7 +52,7 @@ from generate_scenarios import (
     generate_network_pairs,
     save_scenario_pairs,
 )
-from sue_solver import frank_wolfe_sue, solve_sue_batch
+from sue_solver import advanced_sue_solver, solve_sue_batch
 from utils import compute_free_flow_times
 
 
@@ -90,8 +90,9 @@ def _extract_graph_arrays(G) -> tuple:
 def solve_single_graph_sue(
     G,
     od_matrix: np.ndarray,
-    max_iter: int = 100,
-    convergence_threshold: float = 1e-4,
+    max_iter: int = 120,
+    convergence_threshold: float = 1e-5,
+    theta: float = 0.8,
 ) -> np.ndarray:
     """
     Run Frank-Wolfe SUE solve for an arbitrary single graph G (topology/attributes).
@@ -107,8 +108,9 @@ def solve_single_graph_sue(
     Args:
         G:                    NetworkX DiGraph (with capacity, free_flow_time attributes)
         od_matrix:            np.ndarray [num_centroids, num_centroids]
-        max_iter:             Frank-Wolfe maximum iterations
+        max_iter:             SUE maximum iterations
         convergence_threshold: convergence criterion (relative gap)
+        theta:                Logit dispersion parameter
 
     Returns:
         flows: np.ndarray [E], equilibrium flows, indexed by list(G.edges())
@@ -118,7 +120,7 @@ def solve_single_graph_sue(
     """
     edges, capacities, free_flow_times = _extract_graph_arrays(G)
 
-    flows = frank_wolfe_sue(
+    flows = advanced_sue_solver(
         G,
         od_matrix,
         capacities,
@@ -126,6 +128,7 @@ def solve_single_graph_sue(
         max_iter=max_iter,
         convergence_threshold=convergence_threshold,
         verbose=False,
+        theta=theta,
     )
 
     # Check numerical validity: NaN or Inf means divergent solve or a structural problem in the graph
@@ -146,8 +149,9 @@ def run_first_sue_solve(
     od_matrices: np.ndarray,
     capacities: np.ndarray,
     speeds: np.ndarray,
-    max_iter: int = 100,
-    convergence_threshold: float = 1e-4,
+    max_iter: int = 120,
+    convergence_threshold: float = 1e-5,
+    theta: float = 0.8,
 ) -> np.ndarray:
     """
     First SUE batch solving: compute flows_old on fixed topology G.
@@ -163,8 +167,9 @@ def run_first_sue_solve(
         od_matrices:          [N, 11, 11]
         capacities:           [N, 76]  ← indexed by list(G_topo.edges())
         speeds:               [N, 76]  ← indexed by list(G_topo.edges())
-        max_iter:             Frank-Wolfe max iterations per scenario
+        max_iter:             SUE max iterations per scenario
         convergence_threshold: convergence criterion
+        theta:                Logit dispersion parameter
 
     Returns:
         flows_old: np.ndarray [N, 76], indexed by list(G_topo.edges())
@@ -187,7 +192,7 @@ def run_first_sue_solve(
     failed_count = 0
     for i in tqdm(range(num_samples), desc="  First SUE solve"):
         try:
-            flows_i = frank_wolfe_sue(
+            flows_i = advanced_sue_solver(
                 G_topo,
                 od_matrices[i],
                 capacities[i],
@@ -195,6 +200,7 @@ def run_first_sue_solve(
                 max_iter=max_iter,
                 convergence_threshold=convergence_threshold,
                 verbose=False,
+                theta=theta,
             )
             if np.any(np.isnan(flows_i)) or np.any(np.isinf(flows_i)):
                 raise ValueError("flows_old contains NaN/Inf")
@@ -222,8 +228,9 @@ def run_first_sue_solve(
 
 def run_second_sue_solve(
     scenario_pairs: list,
-    max_iter: int = 100,
-    convergence_threshold: float = 1e-4,
+    max_iter: int = 120,
+    convergence_threshold: float = 1e-5,
+    theta: float = 0.8,
     checkpoint_path: str = None,
     checkpoint_interval: int = 200,
 ) -> tuple:
@@ -244,8 +251,9 @@ def run_second_sue_solve(
     Args:
         scenario_pairs:       output of generate_network_pairs, list of dict
                               each dict contains 'G', 'G_prime', 'od_matrix', etc
-        max_iter:             Frank-Wolfe max iterations
+        max_iter:             SUE max iterations
         convergence_threshold: convergence criterion
+        theta:                Logit dispersion parameter
         checkpoint_path:      path for saving intermediate checkpoint (saved every checkpoint_interval samples)
                               if None, no checkpoint is saved
         checkpoint_interval:  checkpoint save interval (number of samples)
@@ -279,6 +287,7 @@ def run_second_sue_solve(
                 od_matrix,
                 max_iter=max_iter,
                 convergence_threshold=convergence_threshold,
+                theta=theta,
             )
 
             # --- Build complete data pair ---
@@ -433,6 +442,7 @@ def run_pipeline(args) -> list:
             G_topo, od_matrices, capacities, speeds,
             max_iter=args.max_iter,
             convergence_threshold=args.convergence_threshold,
+            theta=args.theta,
         )
         np.save(flows_old_path, flows_old)
         print(f"  flows_old saved: {flows_old_path}")
@@ -464,6 +474,7 @@ def run_pipeline(args) -> list:
         scenario_pairs=scenario_pairs,
         max_iter=args.max_iter,
         convergence_threshold=args.convergence_threshold,
+        theta=args.theta,
         checkpoint_path=checkpoint_path if args.checkpoint else None,
         checkpoint_interval=args.checkpoint_interval,
     )
@@ -563,10 +574,12 @@ def parse_args():
                         help='Root directory for all output files')
 
     # SUE solver parameters
-    parser.add_argument('--max_iter', type=int, default=100,
-                        help='Frank-Wolfe max iterations')
-    parser.add_argument('--convergence_threshold', type=float, default=1e-4,
-                        help='Frank-Wolfe convergence criterion (relative gap)')
+    parser.add_argument('--max_iter', type=int, default=120,
+                        help='SUE max iterations')
+    parser.add_argument('--convergence_threshold', type=float, default=1e-5,
+                        help='SUE convergence criterion (relative gap)')
+    parser.add_argument('--theta', type=float, default=0.8,
+                        help='Logit dispersion parameter for SUE')
 
     # Resume job support
     parser.add_argument('--skip_first_solve', action='store_true',

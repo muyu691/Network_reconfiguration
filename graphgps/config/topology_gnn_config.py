@@ -1,8 +1,8 @@
 """
-Phase 2 配置：NetworkPairsTopologyModel 超参数注册
+Phase 2 config: NetworkPairsTopologyModel hyperparameter registration
 
-所有参数均挂载在 cfg.topology_gnn 命名空间下，
-通过 YAML 配置文件或命令行覆盖。
+All parameters are mounted under the cfg.topology_gnn namespace,
+and can be overridden via YAML config file or command line.
 """
 
 from torch_geometric.graphgym.register import register_config
@@ -11,9 +11,9 @@ from yacs.config import CfgNode as CN
 @register_config('topology_gnn')
 def topology_gnn_cfg(cfg):
     """
-    为 NetworkPairsTopologyModel 注册专属配置组。
+    Register dedicated config group for NetworkPairsTopologyModel.
 
-    推荐的 YAML 配置片段：
+    Example YAML config snippet:
       topology_gnn:
         hidden_dim: 128
         num_layers_old: 3
@@ -23,20 +23,26 @@ def topology_gnn_cfg(cfg):
     """
     cfg.topology_gnn = CN()
 
-    # 所有 GNN 层（旧图编码器 + 新图推理器）的统一隐层维度
-    # 节点嵌入、边嵌入均在此空间内
+    # Unified hidden dimension for all GNN layers (OldGraphEncoder + NewGraphReasoner)
+    # Node and edge embeddings are within this space
     cfg.topology_gnn.hidden_dim = 128
 
-    # OldGraphEncoder 中堆叠的 GatedGCN 层数
+    # Number of stacked GatedGCN layers in OldGraphEncoder
     cfg.topology_gnn.num_layers_old = 3
 
-    # NewGraphReasoner 中堆叠的 GatedGCN 层数
+    # Number of stacked GatedGCN layers in NewGraphReasoner
     cfg.topology_gnn.num_layers_new = 3
 
-    # Dropout 概率，应用于 GatedGCN 层内部及 node_fusion / edge_decoder
+    # Dropout probability, applied within GatedGCN layers and node_fusion / edge_decoder
     cfg.topology_gnn.dropout = 0.1
 
-    # GatedGCN 层是否使用残差连接
-    # 注意：此残差指 GatedGCN 层自身的跳跃连接，
-    #       与 NewGraphReasoner 的 node_fusion 层禁止残差无关
+    # Whether to use residual connections in GatedGCN layers
+    # Note: This residual refers to the skip connection within GatedGCN layers themselves,
+    #       and is unrelated to the prohibition of residuals in the node_fusion layer of NewGraphReasoner
     cfg.topology_gnn.residual = True
+
+    # Number of attention heads in ImplicitVirtualRoutingLayer
+    # Controls the granularity of implicit demand virtual links:
+    #   more heads → model can capture more diverse OD/rerouting patterns in parallel
+    # Must satisfy: hidden_dim % num_heads == 0
+    cfg.topology_gnn.num_heads = 4

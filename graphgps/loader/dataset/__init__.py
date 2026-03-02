@@ -1,5 +1,5 @@
-from .sioux_falls_traffic import SiouxFallsTrafficDataset
+from .network_pairs_topology import NetworkPairsTopologyDataset
 
 __all__ = [
-    'SiouxFallsTrafficDataset',
+    'NetworkPairsTopologyDataset',
 ]
