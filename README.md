@@ -12,6 +12,7 @@ This project tackles that problem head-on: given the **old network state** (topo
 
 **Core contributions:**
 - A **Dual-Topology GNN** that treats `(G, G′)` network pairs as first-class citizens
+- An Implicit Demand Virtual Routing Layer using Multi-Head Self-Attention to dynamically establish "virtual edges", enabling single-hop global flow redistribution and bypassing the myopic nature of GNNs.
 - A vectorized **EdgeAlignmentModule** with O(1) hash-based matching of heterogeneous edge sets
 - A **Physics-Informed loss** (Kirchhoff's conservation law) that acts as a structurally grounded regularizer
 
@@ -41,7 +42,7 @@ Each training sample is a `(G, flow_old, G′) → flow_new` tuple.
 ### Phase 2 — Model Architecture
 
 ```
- Old Graph G                              New Graph G′
+Old Graph G                              New Graph G′
  ─────────────────                        ────────────────────
  edge_index_old                           edge_index_new
  edge_attr_old  [E_old, 3]               edge_attr_new  [E_new, 3]
@@ -68,26 +69,31 @@ Each training sample is a `(G, flow_old, G′) → flow_new` tuple.
     ┌────────────────────────────────────┐
     │       NewGraphReasoner             │
     │                                    │
-    │  Node Fusion (no residual):        │
+    │  1. Node Fusion (no residual):     │
     │    cat([ones(N,H), h_nodes_old])   │
     │    → Linear → ReLU → Dropout      │  ← forced re-learning on G′
     │                                    │
-    │  GatedGCN × L  on G′ topology      │
+    │  2. Implicit Virtual Routing:      │  ← breaks GNN myopia
+    │    Global Multi-Head Attention.    │
+    │    Infers implicit OD & transfers  │
+    │    global demand via virtual edges.│
     │                                    │
-    │  Edge Decoder:                     │
+    │  3. GatedGCN × L  on G′ topology   │  ← local physical distribution
+    │                                    │
+    │  4. Edge Decoder:                  │
     │    [x_src ‖ x_dst ‖ aligned_feat] │
     │    → MLP → flow_pred  [E_new, 1]  │  ← unbounded (no activation)
     └────────────────────────────────────┘
 ```
-
 **Loss Function:**
 
 ```
-L_total = L1(pred, true)  +  λ · (1/|V_nc|) Σ_v [(inflow_v - outflow_v) / σ]²
+L_total = L_sup(pred, true) + λ · (1/|V|) Σ_v [ (inflow_v - outflow_v - Δ_v) / σ ]²
 
 where:
   • First term  — supervised regression in normalized space
-  • Second term — Kirchhoff conservation on non-centroid nodes (nodes 12–24)
+  • Second term — Global Kirchhoff flow conservation applied to all nodes
+  • Δ_v         — The net physical demand of node v
   • ÷ σ         — dimensionless rescaling; prevents ~10⁶× gradient imbalance
 ```
 
@@ -122,7 +128,7 @@ pip install scikit-learn networkx tqdm wandb
 cd create_sioux_data
 
 # Generate (G, G') scenario pairs and solve SUE for each
-python main_create_dataset.py
+python solve_network_pairs.py
 
 # Build PyG Data objects and train/val/test splits
 python build_network_pairs_dataset.py \
@@ -155,6 +161,7 @@ Key config options (edit `configs/GatedGCN/network-pairs-topology.yaml`):
 | `topology_gnn.hidden_dim` | 128 | GNN hidden dimension |
 | `topology_gnn.num_layers_old` | 3 | GatedGCN layers in OldGraphEncoder |
 | `topology_gnn.num_layers_new` | 3 | GatedGCN layers in NewGraphReasoner |
+| `topology_gnn.num_heads` | 4 | Attention heads for Implicit Virtual Routing |
 | `model.lambda_cons` | 0.1 | Conservation loss weight λ |
 | `optim.max_epoch` | 200 | Training epochs |
 | `train.batch_size` | 32 | Graphs per batch |
