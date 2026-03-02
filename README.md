@@ -126,6 +126,15 @@ python main.py --cfg configs/Baselines/mlp-baseline.yaml
 # Tier 3: Single-Topology GatedGCN (200 epochs)
 python main.py --cfg configs/Baselines/single-topology-gatedgcn.yaml
 ```
+### Results
+
+| **Model**           | **MAE **   | **RMSE **  | **R2 **    | **WMAPE (%) ** | **Spearman ** |
+| ------------------- | ---------- | ---------- | ---------- | -------------- | ------------- |
+| **Mean Baseline**   | 0.7942     | 1.0046     | 0.0006     | 119.81         | 0.0211        |
+| **HA Baseline**     | 0.3534     | 0.6013     | 0.6420     | 53.31          | 0.8153        |
+| **MLP Baseline**    | 0.2947     | 0.5291     | 0.7228     | 44.46          | 0.8731        |
+| **Single-Top GNN**  | 0.2531     | 0.4674     | 0.7837     | 38.18          | 0.90575       |
+| **Ours (GNN+PINN)** | **0.1839** | **0.3437** | **0.8830** | **27.75**      | **0.9356**    |
 ---
 
 ## Installation
