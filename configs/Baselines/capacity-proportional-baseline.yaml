@@ -1,0 +1,69 @@
+out_dir: results
+metric_best: mae
+metric_agg: argmin
+name_tag: capacity-proportional-baseline
+
+wandb:
+  use: False
+  project: network-pairs-topology
+  entity: your-wandb-entity
+
+dataset:
+  format: PyG-NetworkPairs
+  name: network-pairs-topology
+  task: graph
+  task_type: regression
+  transductive: False
+  dir: create_sioux_data/processed_data/pyg_dataset
+  flow_mean: 0.0
+  flow_std: 1.0
+  node_encoder: False
+  edge_encoder: False
+
+posenc_LapPE:
+  enable: False
+posenc_RWSE:
+  enable: False
+
+train:
+  mode: custom
+  batch_size: 32
+  eval_period: 1
+  ckpt_period: 50
+  enable_ckpt: False
+  auto_resume: False
+
+model:
+  type: capacity_proportional_baseline
+  loss_fun: l1
+  lambda_cons: 0.0
+  cons_norm: l2
+  graph_pooling: none
+
+gt:
+  layer_norm: True
+  batch_norm: False
+
+gnn:
+  batchnorm: False
+
+topology_gnn:
+  hidden_dim: 128
+  num_layers_old: 3
+  num_layers_new: 3
+  dropout: 0.1
+  residual: True
+
+optim:
+  clip_grad_norm: True
+  clip_grad_norm_value: 1.0
+  optimizer: adamW
+  weight_decay: 1.0e-5
+  base_lr: 0.001
+  max_epoch: 1
+  scheduler: cosine_with_warmup
+  num_warmup_epochs: 0
+  min_lr: 1.0e-6
+  reduce_factor: 0.5
+  schedule_patience: 20
+  batch_accumulation: 1

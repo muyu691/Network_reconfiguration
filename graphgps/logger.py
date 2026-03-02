@@ -16,7 +16,7 @@ from torchmetrics.functional import auroc
 
 # OGB metrics not included in clean version (only for OGB datasets)
 # import graphgps.metrics_ogb as metrics_ogb
-from graphgps.metric_wrapper import MetricWrapper
+from graphgps.metric_wrapper import MetricWrapper, wmape, geh_statistic
 
 
 # Stub module for OGB metrics (not used in Sioux Falls regression task)
@@ -207,14 +207,28 @@ class CustomLogger(Logger):
 
     def regression(self):
         true, pred = torch.cat(self._true), torch.cat(self._pred)
+
+        # Force shape alignment: loss_fn may squeeze pred to 1D while true stays 2D
+        if pred.ndim == 1 and true.ndim == 2:
+            pred = pred.view(-1, 1)
+        elif true.ndim == 1 and pred.ndim == 2:
+            true = true.view(-1, 1)
+
         reformat = lambda x: round(float(x), cfg.round)
+
+        import math
+        spearman_val = eval_spearmanr(true.numpy(), pred.numpy())['spearmanr']
+        if math.isnan(spearman_val):
+            spearman_val = 0.0
+
         return {
             'mae': reformat(mean_absolute_error(true, pred)),
             'r2': reformat(r2_score(true, pred, multioutput='uniform_average')),
-            'spearmanr': reformat(eval_spearmanr(true.numpy(),
-                                                 pred.numpy())['spearmanr']),
+            'spearmanr': reformat(spearman_val),
             'mse': reformat(mean_squared_error(true, pred)),
             'rmse': reformat(mean_squared_error(true, pred, squared=False)),
+            'wmape': reformat(wmape(pred, true)),
+            'geh': reformat(geh_statistic(pred, true)),
         }
 
     def update_stats(self, true, pred, loss, lr, time_used, params,
