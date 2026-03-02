@@ -128,7 +128,7 @@ python main.py --cfg configs/Baselines/single-topology-gatedgcn.yaml
 ```
 ### Results
 
-| **Model**           | **MAE **   | **RMSE **  | **R2 **    | **WMAPE (%) ** | **Spearman ** |
+| **Model**           | **MAE**   | **RMSE**  | **R2**    | **WMAPE (%)** | **Spearman** |
 | ------------------- | ---------- | ---------- | ---------- | -------------- | ------------- |
 | **Mean Baseline**   | 0.7942     | 1.0046     | 0.0006     | 119.81         | 0.0211        |
 | **HA Baseline**     | 0.3534     | 0.6013     | 0.6420     | 53.31          | 0.8153        |
