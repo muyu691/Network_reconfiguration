@@ -99,6 +99,35 @@ where:
 
 ---
 
+## Baseline Models
+
+### Baseline Hierarchy
+
+| Tier | Model | Config | What it tests | Topology? | Learnable? |
+|------|-------|--------|---------------|-----------|------------|
+| 0 | **Test-Set Mean** | `configs/Baselines/test-mean-baseline.yaml` | Trivial lower bound (literature standard) | No | No |
+| 1 | **Capacity-Proportional** | `configs/Baselines/capacity-proportional-baseline.yaml` | Can saturation ratio heuristic estimate flows? | No | No |
+| 2 | **Edge MLP** | `configs/Baselines/mlp-baseline.yaml` | Can edge features alone (no message passing) predict flows? | No | Yes |
+| 3 | **Single-Topology GatedGCN** | `configs/Baselines/single-topology-gatedgcn.yaml` | Is dual-graph encoding necessary, or is G' alone sufficient? | G' only | Yes |
+| -- | **Dual-Topology GNN (Ours)** | `configs/GatedGCN/network-pairs-topology.yaml` | Full model with old graph encoding + virtual routing | G + G' | Yes |
+
+### Running Baselines
+
+```bash
+# Tier 0: Test-Set Mean (1 epoch)
+python main.py --cfg configs/Baselines/test-mean-baseline.yaml
+
+# Tier 1: Capacity-Proportional (1 epoch)
+python main.py --cfg configs/Baselines/capacity-proportional-baseline.yaml
+
+# Tier 2: Edge MLP (200 epochs)
+python main.py --cfg configs/Baselines/mlp-baseline.yaml
+
+# Tier 3: Single-Topology GatedGCN (200 epochs)
+python main.py --cfg configs/Baselines/single-topology-gatedgcn.yaml
+```
+---
+
 ## Installation
 
 ```bash
@@ -178,8 +207,14 @@ tensorboard --logdir results/
 
 ```
 GraphGPS_implement-main/
-├── configs/GatedGCN/
-│   └── network-pairs-topology.yaml    # Main training config
+├── configs/
+│   ├── GatedGCN/
+│   │   └── network-pairs-topology.yaml          # Main model config
+│   └── Baselines/
+│       ├── test-mean-baseline.yaml              # Tier 0
+│       ├── capacity-proportional-baseline.yaml   # Tier 1
+│       ├── mlp-baseline.yaml                     # Tier 2
+│       └── single-topology-gatedgcn.yaml         # Tier 3
 ├── create_sioux_data/
 │   ├── generate_scenarios.py          # Base network + mutation generation
 │   ├── solve_network_pairs.py         # Frank-Wolfe SUE solver
@@ -192,7 +227,10 @@ GraphGPS_implement-main/
 │   ├── loss/
 │   │   └── flow_conservation_loss.py  # PINN conservation loss
 │   ├── network/
-│   │   └── topology_model.py          # Core model (3 modules)
+│   │   ├── topology_model.py          # Core dual-topology model (3 modules)
+│   │   ├── heuristic_baselines.py     # Tier 0 & 1: non-learnable baselines
+│   │   ├── mlp_baseline.py            # Tier 2: edge-level MLP
+│   │   └── single_topology_gatedgcn.py # Tier 3: single-graph GatedGCN
 │   └── train/
 │       └── custom_train.py            # Training loop with PINN loss dispatch
 └── main.py
