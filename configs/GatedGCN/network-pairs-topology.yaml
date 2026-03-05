@@ -19,6 +19,9 @@ dataset:
   flow_std: 1.0
   node_encoder: False
   edge_encoder: False
+  use_virtual_links: True
+  mask_capacity: False
+  mask_fft: False
 
 posenc_LapPE:
   enable: False

@@ -1,38 +1,52 @@
 """
-Ablation Baseline: Node-Centric GNN (SAGEConv)
+Ablation Baseline: Node-Centric GNN (GraphConv)
 ================================================
 
 Replaces the edge-centric GatedGCN with a standard node-aggregation GNN
-(GraphSAGE) to demonstrate the necessity of explicit edge feature updates.
+(GraphConv) to demonstrate the necessity of explicit edge feature updates.
 
 Pipeline:
-  OldGraphEncoder (SAGEConv)  → h_nodes_old [N, H]
+  OldGraphEncoder (GraphConv) → h_nodes_old [N, H]
   EdgeAlignmentModule         → aligned_features [E_new, 8]
-  NewGraphReasoner (SAGEConv) → updated x [N, H]
+  NewGraphReasoner (GraphConv) → updated x [N, H]
   EdgeDecoder:  [x_src || x_dst || aligned_features] → flow_pred [E_new, 1]
 
 Key difference from the main model:
-  - SAGEConv aggregates neighbour *node* features only; edge attributes
-    are reduced to a scalar edge_weight via an MLP, losing rich edge info.
+  - GraphConv aggregates neighbour *node* features weighted by a scalar
+    edge_weight derived from an MLP on raw edge attributes.
+    Rich multi-dimensional edge embeddings are compressed to a single
+    scalar → per-layer edge representation update is lost.
   - No explicit edge embedding update per layer (edge-centric property lost).
+
+Why GraphConv instead of SAGEConv:
+  GraphConv natively supports the `edge_weight` argument in its forward(),
+  allowing edge attribute information to participate in message passing.
+  SAGEConv ignores edge_weight, making the baseline unfairly weak.
 """
 
 import torch
 import torch.nn as nn
 from torch_geometric.graphgym.config import cfg
 from torch_geometric.graphgym.register import register_network
-from torch_geometric.nn import SAGEConv
-from torch_geometric.utils import to_dense_batch
+from torch_geometric.nn import GraphConv
 
 from graphgps.network.topology_model import EdgeAlignmentModule
 
 
 class NodeCentricOldEncoder(nn.Module):
-    """Encode old graph using SAGEConv (node-centric aggregation)."""
+    """
+    Encode old graph using GraphConv (node-centric aggregation with scalar edge weight).
+
+    Edge information path:
+      cat([edge_attr_old(3), flow_old(1)]) → MLP → Sigmoid → scalar edge_weight ∈ (0,1)
+    This scalar modulates neighbour contributions during aggregation, but unlike
+    GatedGCN it does NOT maintain a per-edge hidden embedding across layers.
+    """
 
     def __init__(self, hidden_dim: int, num_layers: int, dropout: float):
         super().__init__()
         self.hidden_dim = hidden_dim
+        # [capacity, speed, length, flow_old] → scalar importance weight
         self.edge_to_weight = nn.Sequential(
             nn.Linear(4, hidden_dim),
             nn.ReLU(),
@@ -42,7 +56,7 @@ class NodeCentricOldEncoder(nn.Module):
         self.layers = nn.ModuleList()
         self.norms = nn.ModuleList()
         for _ in range(num_layers):
-            self.layers.append(SAGEConv(hidden_dim, hidden_dim))
+            self.layers.append(GraphConv(hidden_dim, hidden_dim))
             self.norms.append(nn.LayerNorm(hidden_dim))
         self.dropout = nn.Dropout(dropout)
 
@@ -56,7 +70,7 @@ class NodeCentricOldEncoder(nn.Module):
 
         for layer, norm in zip(self.layers, self.norms):
             x_res = x
-            x = layer(x, edge_index_old)
+            x = layer(x, edge_index_old, edge_weight=edge_weight)
             x = norm(x)
             x = torch.relu(x)
             x = self.dropout(x)
@@ -65,7 +79,13 @@ class NodeCentricOldEncoder(nn.Module):
 
 
 class NodeCentricNewReasoner(nn.Module):
-    """Reason on new graph using SAGEConv + edge decoder."""
+    """
+    Reason on new graph using GraphConv + edge decoder.
+
+    Aligned features (8-dim) are compressed to a scalar edge_weight for
+    GraphConv aggregation.  The raw 8-dim features are still fed to the
+    edge decoder (preserving is_new_edge indicator etc.).
+    """
 
     def __init__(self, hidden_dim: int, num_layers: int, dropout: float):
         super().__init__()
@@ -77,6 +97,7 @@ class NodeCentricNewReasoner(nn.Module):
             nn.Dropout(dropout),
         )
 
+        # aligned_features(8) → scalar importance weight
         self.edge_to_weight = nn.Sequential(
             nn.Linear(8, hidden_dim),
             nn.ReLU(),
@@ -87,7 +108,7 @@ class NodeCentricNewReasoner(nn.Module):
         self.layers = nn.ModuleList()
         self.norms = nn.ModuleList()
         for _ in range(num_layers):
-            self.layers.append(SAGEConv(hidden_dim, hidden_dim))
+            self.layers.append(GraphConv(hidden_dim, hidden_dim))
             self.norms.append(nn.LayerNorm(hidden_dim))
         self.dropout_layer = nn.Dropout(dropout)
 
@@ -106,11 +127,11 @@ class NodeCentricNewReasoner(nn.Module):
         x_init = torch.ones(num_nodes, self.hidden_dim, device=device, dtype=dtype)
         x = self.node_fusion(torch.cat([x_init, h_nodes_old], dim=-1))
 
-        edge_weight = self.edge_to_weight(aligned_features).squeeze(-1)
+        edge_weight = self.edge_to_weight(aligned_features).squeeze(-1)  # [E_new]
 
         for layer, norm in zip(self.layers, self.norms):
             x_res = x
-            x = layer(x, edge_index_new)
+            x = layer(x, edge_index_new, edge_weight=edge_weight)
             x = norm(x)
             x = torch.relu(x)
             x = self.dropout_layer(x)
@@ -125,10 +146,11 @@ class NodeCentricNewReasoner(nn.Module):
 @register_network('NodeCentricGNN')
 class NodeCentricGNN(nn.Module):
     """
-    Ablation baseline replacing GatedGCN with standard SAGEConv.
+    Ablation baseline replacing edge-centric GatedGCN with node-centric GraphConv.
 
-    Demonstrates that node-only aggregation without explicit edge feature
-    updates is insufficient for traffic flow prediction tasks.
+    Demonstrates that compressing multi-dimensional edge features into a scalar
+    weight (losing per-layer edge embedding updates) is insufficient for
+    traffic flow prediction under network reconfiguration.
     """
 
     def __init__(self, dim_in: int, dim_out: int) -> None:
