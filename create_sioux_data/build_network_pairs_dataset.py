@@ -297,6 +297,15 @@ def build_single_data_object(
 
     net_demand = torch.from_numpy(net_demand_np)                     # [24], float32
 
+    # -- New-edge mask: identifies edges in G' that do NOT exist in G ------
+    # Used for evaluation-phase analysis (Task 2: new vs old edge metrics).
+    # new_edge_mask[i] = True means edge_list_new[i] is a newly added edge.
+    old_edge_set = set(tuple(e) for e in pair['edge_list_old'])
+    new_edge_mask = torch.tensor(
+        [tuple(e) not in old_edge_set for e in pair['edge_list_new']],
+        dtype=torch.bool,
+    )  # [E_new]
+
     # -- Construct PyG Data object -----------------------------------------
     data = Data(
         # Node features
@@ -317,6 +326,9 @@ def build_single_data_object(
         # Physical constraint labels
         non_centroid_mask=non_centroid_mask,                         # [24], bool
         net_demand=net_demand,                                        # [24], float32, real-space Δi
+
+        # Analysis mask
+        new_edge_mask=new_edge_mask,                                 # [E_new], bool
 
         # Meta info (for debugging/statistics, not used in forward computation)
         num_nodes=NUM_NODES,

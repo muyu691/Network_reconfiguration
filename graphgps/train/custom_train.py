@@ -13,11 +13,14 @@ from torch_geometric.graphgym.utils.epoch import is_eval_epoch, is_ckpt_epoch
 # from graphgps.loss.subtoken_prediction_loss import subtoken_cross_entropy
 from graphgps.utils import cfg_to_dict, flatten_dict, make_wandb_name
 
-# ── Phase 4 注入：PINN 物理守恒损失 ───────────────────────────────────────
-# 当 cfg.model.type == 'topology_gnn' 时，使用此函数替代 compute_loss(pred, true)。
-# 原因：标准 compute_loss 仅接收 (pred, true)，而守恒损失还需要
-#       batch.edge_index_new、batch.non_centroid_mask 等批次级拓扑信息。
+# ── Phase 4 Injection: PINN Physical Conservation Loss ────────────────────────────────
+# When cfg.model.type == 'topology_gnn', use this function to replace compute_loss(pred, true).
+# Reason: Standard compute_loss only takes (pred, true), but conservation loss also requires
+#         batch-level topology info like batch.edge_index_new, batch.non_centroid_mask, etc.
 from graphgps.loss.flow_conservation_loss import compute_pinn_loss
+
+from graphgps.metric_wrapper import wmape
+from torchmetrics.functional import mean_absolute_error
 
 
 def subtoken_cross_entropy(pred, true):
@@ -27,27 +30,27 @@ def subtoken_cross_entropy(pred, true):
 
 def _compute_loss(pred, true, batch):
     """
-    统一损失分发函数：根据 cfg.model.type 自动选择损失函数。
+    Unified loss dispatch function: automatically selects loss function according to cfg.model.type.
 
     - 'topology_gnn' → compute_pinn_loss(pred, batch)
-      使用物理守恒惩罚（Phase 3），需要 batch 上下文。
-    - 其他模型 → compute_loss(pred, true)
-      使用标准 GraphGym 损失（向后兼容所有已有实验）。
+      Uses physical conservation penalty (Phase 3), requires batch context.
+    - Other models → compute_loss(pred, true)
+      Uses standard GraphGym loss (backward compatible with all previous experiments).
 
     Args:
-        pred  : 模型输出张量
-        true  : Ground Truth 张量
-        batch : 当前批次的 PyG Batch 对象
+        pred  : Model output tensor
+        true  : Ground Truth tensor
+        batch : Current batch's PyG Batch object
 
     Returns:
-        loss       : scalar，反向传播使用的总损失
-        pred_score : 预测分数张量，传给 logger 记录指标
+        loss       : scalar, total loss for backpropagation
+        pred_score : predicted score tensor, passed to logger for metric recording
     """
     if cfg.model.type == 'topology_gnn':
-        # PINN 组合损失：L_sup（归一化空间）+ λ × L_cons（无量纲化守恒惩罚）
+        # PINN composite loss: L_sup (in normalized space) + λ × L_cons (dimensionless conservation penalty)
         return compute_pinn_loss(pred, batch)
     else:
-        # 标准 GraphGym 损失（L1/MSE 等，由 cfg.model.loss_fun 控制）
+        # Standard GraphGym loss (L1/MSE etc., controlled by cfg.model.loss_fun)
         return compute_loss(pred, true)
 
 
@@ -64,7 +67,7 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
             _true = true
             _pred = pred_score
         else:
-            # Phase 4：通过 _compute_loss 分发，拓扑模型自动使用 PINN 损失
+            # Phase 4: Dispatch via _compute_loss, topology models automatically use PINN loss
             loss, pred_score = _compute_loss(pred, true, batch)
             _true = true.detach().to('cpu', non_blocking=True)
             _pred = pred_score.detach().to('cpu', non_blocking=True)
@@ -103,7 +106,7 @@ def eval_epoch(logger, loader, model, split='val'):
             _true = true
             _pred = pred_score
         else:
-            # Phase 4：验证/测试阶段同样使用 PINN 损失，保证指标一致性
+            # Phase 4: Also use PINN loss in validation/test phase to ensure metric consistency
             loss, pred_score = _compute_loss(pred, true, batch)
             _true = true.detach().to('cpu', non_blocking=True)
             _pred = pred_score.detach().to('cpu', non_blocking=True)
@@ -115,6 +118,199 @@ def eval_epoch(logger, loader, model, split='val'):
                             dataset_name=cfg.dataset.name,
                             **extra_stats)
         time_start = time.time()
+
+
+def _compute_new_edge_mask(batch, device):
+    """
+    Vectorized computation of new-edge boolean mask for the batched new graph.
+
+    Uses hash-key encoding + torch.isin for memory-safe set membership test.
+    Space complexity: O(E_old + E_new) instead of O(V^2).
+
+    Returns:
+        is_new_edge : [E_new_total], bool, True = edge only in G' (added edge)
+    """
+    total_nodes = batch.num_nodes
+    old_keys = batch.edge_index_old[0] * total_nodes + batch.edge_index_old[1]
+    new_keys = batch.edge_index_new[0] * total_nodes + batch.edge_index_new[1]
+
+    is_new_edge = ~torch.isin(new_keys, old_keys)
+    return is_new_edge
+
+
+@torch.no_grad()
+def detailed_test_evaluation(loader, model, split='test'):
+    """
+    Comprehensive test-phase evaluation. Three analyses in one pass:
+
+      1. Per-graph WMAPE  → 25%, 50%, 75%, 95% percentiles
+      2. New-edge vs Old-edge  → WMAPE, MAE for each subset
+      3. Inference timing → average time per graph (GPU-aware)
+
+    All WMAPE / MAE are computed in **denormalized** (real flow) space when
+    cfg.dataset.flow_mean / flow_std are available, otherwise in normalized space.
+
+    Args:
+        loader : DataLoader for the target split (typically test)
+        model  : trained model (already in eval mode by caller)
+        split  : split name string for logging
+    """
+    model.eval()
+    device = torch.device(cfg.accelerator)
+
+    flow_mean = getattr(cfg.dataset, 'flow_mean', 0.0)
+    flow_std = getattr(cfg.dataset, 'flow_std', 1.0)
+    use_denorm = not (flow_mean == 0.0 and flow_std == 1.0)
+
+    per_graph_wmapes = []
+
+    all_preds_new = []
+    all_trues_new = []
+    all_preds_old = []
+    all_trues_old = []
+
+    total_time_ms = 0.0
+    total_graphs = 0
+
+    use_cuda = (device.type == 'cuda')
+
+    for batch in loader:
+        batch.to(device)
+        num_graphs_in_batch = batch.num_graphs
+        total_graphs += num_graphs_in_batch
+
+        # ── Timed forward pass ──────────────────────────────────────────
+        # Compatible with models returning 2-tuple (pred, true) or
+        # 3-tuple (pred, true, extra_stats) when cfg.gnn.head == 'inductive_edge'.
+        if use_cuda:
+            start_evt = torch.cuda.Event(enable_timing=True)
+            end_evt = torch.cuda.Event(enable_timing=True)
+            start_evt.record()
+            out = model(batch)
+            end_evt.record()
+            torch.cuda.synchronize()
+            batch_time_ms = start_evt.elapsed_time(end_evt)
+        else:
+            t0 = time.perf_counter()
+            out = model(batch)
+            batch_time_ms = (time.perf_counter() - t0) * 1000.0
+
+        if isinstance(out, tuple) and len(out) == 3:
+            pred, true, _ = out
+        else:
+            pred, true = out
+        total_time_ms += batch_time_ms
+
+        pred_cpu = pred.detach().cpu().float()
+        true_cpu = true.detach().cpu().float()
+
+        # Denormalize: real_flow = scaled * std + mean
+        if use_denorm:
+            pred_real = pred_cpu * flow_std + flow_mean
+            true_real = true_cpu * flow_std + flow_mean
+        else:
+            pred_real = pred_cpu
+            true_real = true_cpu
+
+        # ── Per-graph WMAPE ─────────────────────────────────────────────
+        edge_idx = getattr(batch, 'edge_index_new', batch.edge_index)
+        edge_batch = batch.batch[edge_idx[0]].detach().cpu()
+        for g in range(num_graphs_in_batch):
+            mask_g = (edge_batch == g)
+            p_g = pred_real[mask_g]
+            t_g = true_real[mask_g]
+            if t_g.numel() > 0:
+                w = wmape(p_g, t_g).item()
+                per_graph_wmapes.append(w)
+
+        # ── New / Old edge separation ───────────────────────────────────
+        if hasattr(batch, 'new_edge_mask'):
+            is_new_edge = batch.new_edge_mask.bool().detach().cpu()
+        elif hasattr(batch, 'edge_index_new') and hasattr(batch, 'edge_index_old'):
+            is_new_edge = _compute_new_edge_mask(batch, device).detach().cpu()
+        else:
+            is_new_edge = torch.zeros(pred_real.shape[0], dtype=torch.bool)
+
+        if is_new_edge.any():
+            all_preds_new.append(pred_real[is_new_edge])
+            all_trues_new.append(true_real[is_new_edge])
+        if (~is_new_edge).any():
+            all_preds_old.append(pred_real[~is_new_edge])
+            all_trues_old.append(true_real[~is_new_edge])
+
+    # ════════════════════════════════════════════════════════════════════
+    # Aggregate & Log
+    # ════════════════════════════════════════════════════════════════════
+    space_tag = "denormalized (veh/hr)" if use_denorm else "normalized"
+
+    # ── 1. WMAPE Percentiles ────────────────────────────────────────────
+    if per_graph_wmapes:
+        w_tensor = torch.tensor(per_graph_wmapes, dtype=torch.float64)
+        quantiles = [0.25, 0.50, 0.75, 0.95]
+        q_values = torch.quantile(w_tensor, torch.tensor(quantiles, dtype=torch.float64))
+        logging.info(
+            f"\n{'='*70}\n"
+            f"  [{split.upper()}] Per-Graph WMAPE Distribution ({len(per_graph_wmapes)} graphs, {space_tag})\n"
+            f"{'='*70}\n"
+            f"    Mean   WMAPE : {w_tensor.mean():.6f}\n"
+            f"    Std    WMAPE : {w_tensor.std():.6f}\n"
+            f"    Min    WMAPE : {w_tensor.min():.6f}\n"
+            f"    25%  percentile : {q_values[0]:.6f}\n"
+            f"    50%  percentile : {q_values[1]:.6f} (median)\n"
+            f"    75%  percentile : {q_values[2]:.6f}\n"
+            f"    95%  percentile : {q_values[3]:.6f}\n"
+            f"    Max    WMAPE : {w_tensor.max():.6f}\n"
+            f"{'='*70}"
+        )
+
+    # ── 2. New-Edge vs Old-Edge Metrics ─────────────────────────────────
+    def _edge_metrics(preds_list, trues_list, label):
+        if not preds_list:
+            logging.info(f"    {label}: No edges found in test set.")
+            return
+        p = torch.cat(preds_list)
+        t = torch.cat(trues_list)
+        w = wmape(p, t).item()
+        m = mean_absolute_error(p.view(-1), t.view(-1)).item()
+        logging.info(f"    {label}: count={p.shape[0]:>7d}  WMAPE={w:.6f}  MAE={m:.4f}")
+
+    logging.info(
+        f"\n{'='*70}\n"
+        f"  [{split.upper()}] New-Edge vs Old-Edge Metrics ({space_tag})\n"
+        f"{'='*70}"
+    )
+    _edge_metrics(all_preds_old, all_trues_old, "Old edges (retained)")
+    _edge_metrics(all_preds_new, all_trues_new, "New edges (added)   ")
+    # Combined
+    all_p = all_preds_old + all_preds_new
+    all_t = all_trues_old + all_trues_new
+    _edge_metrics(all_p, all_t, "All edges (combined) ")
+    logging.info(f"{'='*70}")
+
+    # ── 3. Inference Timing ─────────────────────────────────────────────
+    avg_time_per_graph = total_time_ms / max(total_graphs, 1)
+    logging.info(
+        f"\n{'='*70}\n"
+        f"  [{split.upper()}] Inference Timing\n"
+        f"{'='*70}\n"
+        f"    Device               : {device}\n"
+        f"    Total graphs         : {total_graphs}\n"
+        f"    Total inference time : {total_time_ms:.2f} ms\n"
+        f"    Avg time per graph   : {avg_time_per_graph:.4f} ms\n"
+        f"{'='*70}"
+    )
+
+    return {
+        'wmape_percentiles': {
+            'p25': float(q_values[0]) if per_graph_wmapes else None,
+            'p50': float(q_values[1]) if per_graph_wmapes else None,
+            'p75': float(q_values[2]) if per_graph_wmapes else None,
+            'p95': float(q_values[3]) if per_graph_wmapes else None,
+        },
+        'wmape_mean': float(w_tensor.mean()) if per_graph_wmapes else None,
+        'avg_time_per_graph_ms': avg_time_per_graph,
+        'total_graphs': total_graphs,
+    }
 
 
 @register_train('custom')
@@ -240,6 +436,14 @@ def custom_train(loggers, loaders, model, optimizer, scheduler):
                                      f"gamma={gtl.attention.gamma.item()}")
     logging.info(f"Avg time per epoch: {np.mean(full_epoch_times):.2f}s")
     logging.info(f"Total train loop time: {np.sum(full_epoch_times) / 3600:.2f}h")
+
+    # ── Detailed test evaluation (WMAPE percentiles, new/old edge, timing) ──
+    if len(loaders) >= 3:
+        logging.info("\n" + "=" * 70)
+        logging.info("  Running detailed test evaluation ...")
+        logging.info("=" * 70)
+        detailed_test_evaluation(loaders[2], model, split='test')
+
     for logger in loggers:
         logger.close()
     if cfg.train.ckpt_clean:
@@ -296,6 +500,14 @@ def inference_only(loggers, loaders, model, optimizer=None, scheduler=None):
         f"test_loss: {perf[2][best_epoch]['loss']:.4f} {best_test}"
     )
     logging.info(f'Done! took: {time.perf_counter() - start_time:.2f}s')
+
+    # ── Detailed test evaluation (WMAPE percentiles, new/old edge, timing) ──
+    if len(loaders) >= 3:
+        logging.info("\n" + "=" * 70)
+        logging.info("  Running detailed test evaluation ...")
+        logging.info("=" * 70)
+        detailed_test_evaluation(loaders[2], model, split='test')
+
     for logger in loggers:
         logger.close()
 
