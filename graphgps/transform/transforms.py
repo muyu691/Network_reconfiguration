@@ -2,7 +2,52 @@ import logging
 
 import torch
 from torch_geometric.utils import subgraph
+from torch_geometric.graphgym.config import cfg
 from tqdm import tqdm
+
+
+class MaskEdgeFeatureTransform:
+    """
+    Zero-out specific columns in edge_attr_old and edge_attr_new for
+    input feature importance ablation.
+
+    edge_attr column layout (from build_network_pairs_dataset.py):
+      col 0 : capacity   (vehicles/hour, normalized)
+      col 1 : speed      (km/h, normalized) — proxy for FFT since FFT = length/speed
+      col 2 : length     (km, normalized)
+
+    When mask_capacity=True, col 0 is zeroed in both edge_attr_old and edge_attr_new.
+    When mask_fft=True,      col 1 is zeroed (masking speed ≈ removing FFT information).
+    """
+
+    def __init__(self, mask_capacity: bool = False, mask_fft: bool = False):
+        self.mask_capacity = mask_capacity
+        self.mask_fft = mask_fft
+
+    def __call__(self, data):
+        cols_to_mask = []
+        if self.mask_capacity:
+            cols_to_mask.append(0)
+        if self.mask_fft:
+            cols_to_mask.append(1)
+
+        if not cols_to_mask:
+            return data
+
+        for attr_name in ('edge_attr_old', 'edge_attr_new'):
+            attr = getattr(data, attr_name, None)
+            if attr is not None:
+                attr = attr.clone()
+                for col in cols_to_mask:
+                    if col < attr.size(1):
+                        attr[:, col] = 0.0
+                setattr(data, attr_name, attr)
+
+        return data
+
+    def __repr__(self):
+        return (f"{self.__class__.__name__}("
+                f"mask_capacity={self.mask_capacity}, mask_fft={self.mask_fft})")
 
 
 def pre_transform_in_memory(dataset, transform_func, show_progress=False):

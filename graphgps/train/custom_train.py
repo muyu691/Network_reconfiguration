@@ -46,11 +46,9 @@ def _compute_loss(pred, true, batch):
         loss       : scalar, total loss for backpropagation
         pred_score : predicted score tensor, passed to logger for metric recording
     """
-    if cfg.model.type == 'topology_gnn':
-        # PINN composite loss: L_sup (in normalized space) + λ × L_cons (dimensionless conservation penalty)
+    if cfg.model.type in ('topology_gnn', 'NodeCentricGNN'):
         return compute_pinn_loss(pred, batch)
     else:
-        # Standard GraphGym loss (L1/MSE etc., controlled by cfg.model.loss_fun)
         return compute_loss(pred, true)
 
 

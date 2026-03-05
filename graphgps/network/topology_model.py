@@ -289,36 +289,36 @@ class EdgeAlignmentModule(nn.Module):
 
 
 # ============================================================
-# Implicit Demand Virtual Routing Layer (隐式需求虚拟边层)
+# Implicit Demand Virtual Routing Layer (Implicit Virtual Edge Layer)
 # ============================================================
 
 class ImplicitVirtualRoutingLayer(nn.Module):
     r"""
-    隐式需求虚拟路由层 —— 通过全局自注意力打破 GNN 局部感受野的限制。
+    Implicit demand virtual routing layer -- uses global self-attention to break the locality limitation of GNN receptive field.
 
-    物理意义:
-      交通网络发生断链或属性剧变时，流量会在全局范围内重新分配。
-      传统 GNN 每层只聚合 1-hop 邻居，对于远端 OD 对之间的流量转移，
-      需要叠加大量层数才能传播信号，而叠加层数又会引发过平滑。
+    Physical meaning:
+      When a traffic network experiences disconnects or dramatic changes in attributes, flows get redistributed globally.
+      Traditional GNN aggregates only 1-hop neighbors per layer, thus for flow transfer between distant OD pairs,
+      many layers must be stacked to propagate the signal, but this can cause over-smoothing.
 
-      本层在同一图内的所有节点之间计算 Self-Attention 权重，
-      等价于动态建立了"隐式虚拟边" (Implicit Virtual Links)：
-        - 注意力得分 $\alpha_{ij}$ 高 → 节点 $i, j$ 之间存在强关联
-          （潜在 OD 关系、替代路径关系、流量守恒约束关系）
-        - 这些虚拟边让全局流量重分配信号能在**单层内**瞬间传播
+      This layer computes self-attention weights among all nodes within the same graph,
+      equivalent to dynamically establishing "implicit virtual edges" (Implicit Virtual Links):
+        - High attention score $\alpha_{ij}$ → strong association between node $i$ and $j$
+          (potential OD relationship, alternative path relationship, flow conservation constraint relationship)
+        - These virtual edges allow global flow redistribution signals to be transmitted in a single layer
 
-      数学表达:
+      Mathematical expression:
         $$\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^T}{\sqrt{d_k}}\right) V$$
 
-      架构 (Post-LN Transformer Block):
+      Architecture (Post-LN Transformer Block):
         $$\mathbf{x}_{\text{mid}} = \text{LN}\!\left(\mathbf{x} + \text{MHA}(\mathbf{x})\right)$$
         $$\mathbf{x}_{\text{out}} = \text{LN}\!\left(\mathbf{x}_{\text{mid}} + \text{FFN}(\mathbf{x}_{\text{mid}})\right)$$
 
-    Batch 安全性 (严防跨图污染):
-      PyG 的 to_dense_batch 将扁平的 [N, H] → [B, Max_N, H] 的 Dense 张量，
-      配合 key_padding_mask=~mask 传入 MultiheadAttention，可保证:
-        1. Padding 位置（虚假节点）不会参与注意力计算
-        2. 不同图的节点之间绝不会发生任何信息交换
+    Batch safety (strictly prevents cross-graph contamination):
+      PyG's to_dense_batch transforms flat [N, H] → [B, Max_N, H] dense tensors,
+      together with key_padding_mask=~mask passed to MultiheadAttention, ensures:
+        1. Padding positions (dummy nodes) do not participate in attention computation
+        2. Nodes from different graphs will never communicate with each other
     """
 
     def __init__(
@@ -329,8 +329,8 @@ class ImplicitVirtualRoutingLayer(nn.Module):
     ) -> None:
         super().__init__()
 
-        # 多头自注意力：在同一图内建立全局隐式虚拟边
-        # batch_first=True → 输入/输出格式 [B, Seq, H]，与 to_dense_batch 输出一致
+        # Multi-head self-attention: establish global implicit virtual edges within the same graph
+        # batch_first=True → input/output format [B, Seq, H], consistent with to_dense_batch output
         self.attn = nn.MultiheadAttention(
             embed_dim=hidden_dim,
             num_heads=num_heads,
@@ -338,13 +338,13 @@ class ImplicitVirtualRoutingLayer(nn.Module):
             batch_first=True,
         )
 
-        # Post-Attention LayerNorm (残差融合后归一化)
+        # Post-Attention LayerNorm (normalize after residual fusion)
         self.norm1 = nn.LayerNorm(hidden_dim)
         # Post-FFN LayerNorm
         self.norm2 = nn.LayerNorm(hidden_dim)
 
-        # 前馈网络 (FFN)：两层 Linear + ReLU，标准 4x 扩展比
-        # 作用：对注意力聚合后的全局信息做非线性变换
+        # Feed Forward Network (FFN): two Linear + ReLU layers, standard 4x expansion ratio
+        # Function: applies nonlinear transform to globally aggregated information from attention
         self.ffn = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 4),
             nn.ReLU(),
@@ -355,33 +355,33 @@ class ImplicitVirtualRoutingLayer(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,      # [N, hidden_dim]  扁平节点特征
-        batch: torch.Tensor,   # [N]              节点归属索引
+        x: torch.Tensor,      # [N, hidden_dim]  flat node features
+        batch: torch.Tensor,   # [N]             node belong-to index
     ) -> torch.Tensor:         # → [N, hidden_dim]
         """
-        前向传播：全局自注意力 → 残差 + LayerNorm → FFN → 残差 + LayerNorm。
+        Forward pass: global self-attention → residual + LayerNorm → FFN → residual + LayerNorm.
 
         Args:
-            x     : 扁平节点特征，batch 内所有图的节点拼接在一起，形状 [N, H]
-            batch : 节点归属索引，第 i 个节点属于第 batch[i] 个图，形状 [N]
+            x     : Flat node features. Nodes of all graphs in batch concatenated together. Shape [N, H]
+            batch : Node assignment indices; the i-th node belongs to batch[i]-th graph. Shape [N]
 
         Returns:
-            x_flat : 具有全局视野的节点特征（隐式虚拟边信息已融合），形状 [N, H]
+            x_flat : Node features with global perspective (contains implicit virtual edge information), shape [N, H]
         """
-        # ── Step A: Dense 转换 ─────────────────────────────────────
-        # 将扁平的 [N, H] 转为三维 Dense 张量 [B, Max_N, H]
-        # mask: [B, Max_N]，True = 真实节点，False = Padding（用 0 填充）
-        # 物理意义：将 mini-batch 中各个图的节点对齐为等长序列，
-        #           为 Self-Attention 的矩阵运算做准备
+        # -- Step A: Dense transformation --------------------------------
+        # Transform flat [N, H] into 3D dense tensor [B, Max_N, H]
+        # mask: [B, Max_N], True = real node, False = padding (filled with 0)
+        # Physical meaning: aligns node lists for each graph in mini-batch to same-length sequences
+        #                   for Self-Attention matrix ops
         x_dense, mask = to_dense_batch(x, batch)  # [B, Max_N, H], [B, Max_N]
 
-        # ── Step B: 全局自注意力（建立隐式虚拟边）──────────────────
-        # key_padding_mask=~mask: 值为 True 的位置会被 Attention 忽略
-        #   → Padding 节点不产生/不接收注意力
-        #   → 不同图之间的节点绝对不会通信（因为它们在不同的 batch 维度）
-        # 物理意义：每个节点与同图内所有其它节点计算注意力，
-        #           建立基于特征相似性的"隐式虚拟边"，
-        #           让潜在 OD 对和替代路径关系被一步到位地捕获
+        # -- Step B: Global self-attention (establish implicit virtual edges) -----------
+        # key_padding_mask=~mask: Positions with value True are ignored by attention
+        #   → Padding nodes neither generate nor receive attention
+        #   → Nodes in different graphs never communicate (because they're on different batch dimension)
+        # Physical meaning: each node calculates attention with all other nodes in the same graph,
+        #                   building feature similarity-based "implicit virtual edges",
+        #                   so that potential OD and alternative path relations are captured instantly
         attn_out, _ = self.attn(
             query=x_dense,
             key=x_dense,
@@ -389,19 +389,19 @@ class ImplicitVirtualRoutingLayer(nn.Module):
             key_padding_mask=~mask,
         )  # [B, Max_N, H]
 
-        # ── Step C: 残差连接 + LayerNorm (Post-Attention) ─────────
+        # -- Step C: Residual connection + LayerNorm (Post-Attention) -----
         # $\mathbf{x}_{\text{mid}} = \text{LN}(\mathbf{x} + \text{MHA}(\mathbf{x}))$
-        # 残差连接保留原始局部特征，注意力输出叠加全局信息
+        # Residual connection retains original local features, with attention output adding global info
         x_dense = self.norm1(x_dense + attn_out)  # [B, Max_N, H]
 
-        # ── Step D: FFN + 残差 + LayerNorm ────────────────────────
+        # -- Step D: FFN + residual + LayerNorm ---------------------------
         # $\mathbf{x}_{\text{out}} = \text{LN}(\mathbf{x}_{\text{mid}} + \text{FFN}(\mathbf{x}_{\text{mid}}))$
         ffn_out = self.ffn(x_dense)                # [B, Max_N, H]
         x_dense = self.norm2(x_dense + ffn_out)    # [B, Max_N, H]
 
-        # ── Step E: 还原为扁平格式 ────────────────────────────────
-        # 用 mask 布尔索引取出真实节点，过滤掉 Padding
-        # mask 中 True 的数量恰好等于 N（所有真实节点总数），维度严格匹配
+        # -- Step E: Restore as flat format -------------------------------
+        # Use mask boolean indexing to select real nodes, filter out padding
+        # The number of True in mask matches N (number of all real nodes), dimension matches strictly
         x_flat = x_dense[mask]  # [N, H]
 
         return x_flat
@@ -468,15 +468,19 @@ class NewGraphReasoner(nn.Module):
             nn.Dropout(dropout),
         )
 
-        # -- 隐式需求虚拟路由层 (Implicit Virtual Routing) ----------------
-        # 在 node_fusion 输出后、GatedGCN 局部消息传递之前，
-        # 通过全局自注意力为每个节点注入全图视野，
-        # 打破 GNN 短视问题，让远端的流量重分配信号一步到位地传播。
-        self.virtual_routing = ImplicitVirtualRoutingLayer(
-            hidden_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-        )
+        # -- Implicit Demand Virtual Routing Layer (Implicit Virtual Routing) -------------
+        # After node_fusion output and before GatedGCN local message passing,
+        # inject full-graph perspective to each node via global self-attention,
+        # overcoming GNN shortsightedness, allowing far-end flow redistribution signals
+        # to propagate instantly.
+        # Controlled by cfg.dataset.use_virtual_links (default True).
+        self.use_virtual_links = cfg.dataset.use_virtual_links
+        if self.use_virtual_links:
+            self.virtual_routing = ImplicitVirtualRoutingLayer(
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+            )
 
         # Project the aligned edge features: [E_new, 8] → [E_new, H]
         # GatedGCNLayer requires same dimension for node and edge features
@@ -519,7 +523,7 @@ class NewGraphReasoner(nn.Module):
         aligned_features: torch.Tensor,  # [E_new, 8]
         h_nodes_old: torch.Tensor,       # [num_nodes, H]
         num_nodes: int,
-        batch_vec: torch.Tensor,         # [num_nodes] 节点归属索引（必须由 PyG Batch 提供）
+        batch_vec: torch.Tensor,         # [num_nodes] node assignment index (must be provided by PyG Batch)
     ) -> torch.Tensor:                   # → [E_new, 1]
 
         device = h_nodes_old.device
@@ -541,25 +545,15 @@ class NewGraphReasoner(nn.Module):
         x_cat = torch.cat([x_new_init, h_nodes_old], dim=-1)  # [N, 2H]
         x = self.node_fusion(x_cat)                            # [N, H]
 
-        # -- 隐式需求虚拟路由 (Implicit Virtual Routing) -------------------
-        # 在局部 GatedGCN 消息传递之前，先通过全局自注意力建立隐式虚拟边，
-        # 让每个节点获得全图视野。这对断链等剧烈拓扑变异至关重要：
-        #   - 断链后，受影响节点需要立即知道远端替代路径的存在
-        #   - 传统 GNN 需要多跳才能传播的全局重分配信号，在这里一步完成
-        #
-        # ⚠️  Fail-fast 校验：batch_vec 必须由上层 (NetworkPairsTopologyModel) 显式传入。
-        #     若为 None，说明 PyG Batch 未能生成 batch.batch（通常因为 Data 对象缺少 x 字段），
-        #     此时若静默构造全零 batch_vec，会导致跨图注意力污染——这是灾难性的隐式 Bug。
-        #     确保 build_network_pairs_dataset.py 中 Data 对象包含 data.x 即可避免此问题。
-        assert batch_vec is not None, (
-            "batch_vec is None! ImplicitVirtualRoutingLayer 需要 PyG 的 batch.batch 向量来区分图。"
-            "请确保 Data 对象包含 x 字段（如 data.x = torch.ones(num_nodes, 1)），"
-            "以便 PyG Batch.from_data_list() 自动生成 batch.batch。"
-        )
-        assert batch_vec.shape[0] == num_nodes, (
-            f"batch_vec 长度 ({batch_vec.shape[0]}) 与 num_nodes ({num_nodes}) 不匹配！"
-        )
-        x = self.virtual_routing(x, batch_vec)  # [N, H]，已融合全局隐式 OD 信息
+        # -- Implicit Demand Virtual Routing Layer (Implicit Virtual Routing) -------------------
+        if self.use_virtual_links:
+            assert batch_vec is not None, (
+                "batch_vec is None! ImplicitVirtualRoutingLayer requires PyG's batch.batch vector."
+            )
+            assert batch_vec.shape[0] == num_nodes, (
+                f"batch_vec length ({batch_vec.shape[0]}) does not match num_nodes ({num_nodes})!"
+            )
+            x = self.virtual_routing(x, batch_vec)  # [N, H], global implicit OD information fused
 
         # -- Aligned edge feature projection -------------------------------
         # Project 8-dim aligned feature into hidden space for GatedGCNLayer
@@ -704,8 +698,8 @@ class NetworkPairsTopologyModel(nn.Module):
 
         # -- Module 3: Fusing history, reasoning flows on new graph -----------
         # Output: flow_pred [E_new_total, 1]
-        # batch.batch: [N_total] 节点归属索引，传给 ImplicitVirtualRoutingLayer
-        #   确保全局自注意力只在同一图内的节点间进行
+        # batch.batch: [N_total] node assignment index, passed to ImplicitVirtualRoutingLayer
+        #   Ensures global self-attention only occurs between nodes in the same graph
         flow_pred = self.reasoner(
             edge_index_new=batch.edge_index_new,
             aligned_features=aligned_features,

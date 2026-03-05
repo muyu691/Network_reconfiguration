@@ -28,7 +28,8 @@ from graphgps.loader.split_generator import (prepare_splits,
 # from graphgps.transform.task_preprocessing import task_specific_preprocessing
 from graphgps.transform.transforms import (pre_transform_in_memory,
                                            typecast_x, concat_x_and_pos,
-                                           clip_graphs_to_size)
+                                           clip_graphs_to_size,
+                                           MaskEdgeFeatureTransform)
 
 
 # Stub functions for unused preprocessing features
@@ -209,6 +210,14 @@ def load_dataset_master(format, name, dataset_dir):
         raise ValueError(f"Unknown data format: {format}")
 
     pre_transform_in_memory(dataset, partial(task_specific_preprocessing, cfg=cfg))
+
+    # ── Ablation: Input Feature Masking ──────────────────────────────────────
+    mask_cap = getattr(cfg.dataset, 'mask_capacity', False)
+    mask_fft = getattr(cfg.dataset, 'mask_fft', False)
+    if mask_cap or mask_fft:
+        feat_mask = MaskEdgeFeatureTransform(mask_capacity=mask_cap, mask_fft=mask_fft)
+        logging.info(f"[Ablation] Applying {feat_mask}")
+        pre_transform_in_memory(dataset, feat_mask)
 
     log_loaded_dataset(dataset, format, name)
 

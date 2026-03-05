@@ -10,3 +10,4 @@ __all__ = [
 from . import heuristic_baselines
 from . import mlp_baseline
 from . import single_topology_gatedgcn
+from . import node_centric_baseline
