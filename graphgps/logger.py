@@ -16,7 +16,7 @@ from torchmetrics.functional import auroc
 
 # OGB metrics not included in clean version (only for OGB datasets)
 # import graphgps.metrics_ogb as metrics_ogb
-from graphgps.metric_wrapper import MetricWrapper, wmape, geh_statistic
+from graphgps.metric_wrapper import MetricWrapper, wmape
 
 
 # Stub module for OGB metrics (not used in Sioux Falls regression task)
@@ -224,11 +224,9 @@ class CustomLogger(Logger):
         return {
             'mae': reformat(mean_absolute_error(true, pred)),
             'r2': reformat(r2_score(true, pred, multioutput='uniform_average')),
-            'spearmanr': reformat(spearman_val),
             'mse': reformat(mean_squared_error(true, pred)),
             'rmse': reformat(mean_squared_error(true, pred, squared=False)),
             'wmape': reformat(wmape(pred, true)),
-            'geh': reformat(geh_statistic(pred, true)),
         }
 
     def update_stats(self, true, pred, loss, lr, time_used, params,
